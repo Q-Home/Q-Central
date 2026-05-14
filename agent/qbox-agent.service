@@ -1,0 +1,14 @@
+[Unit]
+Description=Q-Box Central Agent
+After=network-online.target zerotier-one.service docker.service
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/qbox/agent.env
+ExecStart=/opt/qbox-agent/.venv/bin/python -m qbox_agent
+WorkingDirectory=/opt/qbox-agent
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
