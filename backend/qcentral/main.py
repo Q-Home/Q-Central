@@ -1,6 +1,6 @@
 import json
 from datetime import datetime, timezone
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session, select
 from slowapi import Limiter
@@ -10,8 +10,8 @@ from slowapi.middleware import SlowAPIMiddleware
 from .config import get_settings
 from .db import get_session, init_db
 from .models import AuditLog, Device, DeviceStatus, Job
-from .schemas import HeartbeatRequest, JobCreateRequest, ProvisionRequest, ProvisionResponse, RegisterSerialRequest, RegisterSerialResponse
-from .security import hash_secret, new_token, require_admin, require_agent_token, verify_secret
+from .schemas import HeartbeatRequest, JobCreateRequest, LoginRequest, ProvisionRequest, ProvisionResponse, RegisterSerialRequest, RegisterSerialResponse
+from .security import SESSION_COOKIE_NAME, authenticate_admin, create_admin_session, hash_secret, new_token, require_admin, require_agent_token, verify_secret
 from .zerotier import authorize_member
 
 ALLOWED_JOB_KINDS = {"agent_update", "app_update", "app_restart", "compose_pull"}
@@ -21,7 +21,7 @@ limiter = Limiter(key_func=get_remote_address, default_limits=["240/minute"])
 app = FastAPI(title="Q-Central API", version="1.0.0")
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
-app.add_middleware(CORSMiddleware, allow_origins=settings.cors_list, allow_credentials=False, allow_methods=["GET", "POST", "PATCH"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=settings.cors_list, allow_credentials=True, allow_methods=["GET", "POST", "PATCH"], allow_headers=["Content-Type", "Authorization", "X-Agent-Token"])
 
 
 @app.exception_handler(RateLimitExceeded)
@@ -38,9 +38,49 @@ def audit(session: Session, event: str, actor: str, serial: str | None = None, d
     session.add(AuditLog(event=event, actor=actor, serial=serial, detail=detail))
 
 
+def client_ip(request: Request) -> str:
+    return request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "service": "q-central"}
+
+
+@app.post("/api/auth/login")
+@limiter.limit("5/minute")
+def login(request: Request, response: Response, body: LoginRequest, session: Session = Depends(get_session)):
+    ip = client_ip(request)
+    if not authenticate_admin(body.username, body.password):
+        audit(session, "admin_login_failed", body.username, detail=ip)
+        session.commit()
+        raise HTTPException(status_code=401, detail="invalid login")
+    token = create_admin_session(body.username)
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        token,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        max_age=settings.session_minutes * 60,
+        path="/",
+    )
+    audit(session, "admin_login_success", body.username, detail=ip)
+    session.commit()
+    return {"ok": True, "username": body.username, "expires_in": settings.session_minutes * 60}
+
+
+@app.post("/api/auth/logout")
+def logout(response: Response, actor: str = Depends(require_admin), session: Session = Depends(get_session)):
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    audit(session, "admin_logout", actor)
+    session.commit()
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+def me(actor: str = Depends(require_admin)):
+    return {"username": actor, "role": "admin"}
 
 
 @app.post("/api/serials", response_model=RegisterSerialResponse)
@@ -50,14 +90,7 @@ def register_serial(request: Request, body: RegisterSerialRequest, session: Sess
     if existing:
         raise HTTPException(status_code=409, detail="serial already exists")
     claim_token = new_token("claim")
-    device = Device(
-        serial=body.serial,
-        claim_token_hash=hash_secret(claim_token),
-        name=body.name,
-        customer=body.customer,
-        site=body.site,
-        model=body.model,
-    )
+    device = Device(serial=body.serial, claim_token_hash=hash_secret(claim_token), name=body.name, customer=body.customer, site=body.site, model=body.model)
     session.add(device)
     audit(session, "serial_registered", actor, body.serial)
     session.commit()
