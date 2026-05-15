@@ -9,16 +9,17 @@ from slowapi.util import get_remote_address
 from slowapi.middleware import SlowAPIMiddleware
 from .config import get_settings
 from .db import get_session, init_db
-from .models import AuditLog, Device, DeviceStatus, Job
-from .schemas import HeartbeatRequest, JobCreateRequest, LoginRequest, ProvisionRequest, ProvisionResponse, RegisterSerialRequest, RegisterSerialResponse
+from .models import AuditLog, Device, DeviceStatus, Job, User, UserRole
+from .schemas import HeartbeatRequest, JobCreateRequest, LoginRequest, ProfileUpdateRequest, ProvisionRequest, ProvisionResponse, RegisterSerialRequest, RegisterSerialResponse, UserCreateRequest, UserUpdateRequest
 from .security import SESSION_COOKIE_NAME, authenticate_admin, create_admin_session, hash_secret, new_token, require_admin, require_agent_token, require_portal_token, verify_secret
 from .zerotier import authorize_member
 
 ALLOWED_JOB_KINDS = {"agent_update", "app_update", "app_restart", "compose_pull"}
+ADMIN_ROLES = {"superadmin", "admin"}
 
 settings = get_settings()
 limiter = Limiter(key_func=get_remote_address, default_limits=["240/minute"])
-app = FastAPI(title="Q-Central API", version="1.0.0")
+app = FastAPI(title="Q-Central API", version="1.1.0")
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(CORSMiddleware, allow_origins=settings.cors_list, allow_credentials=True, allow_methods=["GET", "POST", "PATCH"], allow_headers=["Content-Type", "Authorization", "X-Agent-Token", "X-Portal-Token"])
@@ -60,13 +61,50 @@ def as_utc_naive(value):
     return value
 
 
+def user_payload(user: User) -> dict:
+    return {
+        "username": user.username,
+        "role": user.role.value if hasattr(user.role, "value") else str(user.role),
+        "full_name": user.full_name,
+        "email": user.email,
+        "is_active": user.is_active,
+        "mfa_enabled": user.mfa_enabled,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+        "updated_at": user.updated_at.isoformat() if user.updated_at else None,
+        "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
+    }
+
+
+def get_or_bootstrap_user(session: Session, username: str) -> User | None:
+    user = session.get(User, username)
+    if user:
+        return user
+    if username == settings.admin_username:
+        user = User(username=settings.admin_username, credential_hash=settings.admin_credential_hash, role=UserRole.superadmin, full_name="Initial admin", is_active=True)
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+        return user
+    return None
+
+
+def current_user(session: Session, actor: str) -> User:
+    user = get_or_bootstrap_user(session, actor)
+    if not user or not user.is_active:
+        raise HTTPException(status_code=403, detail="inactive or unknown user")
+    return user
+
+
+def require_admin_role(session: Session, actor: str) -> User:
+    user = current_user(session, actor)
+    role = user.role.value if hasattr(user.role, "value") else str(user.role)
+    if role not in ADMIN_ROLES:
+        raise HTTPException(status_code=403, detail="admin role required")
+    return user
+
+
 def latest_device_heartbeat(session: Session, serial: str) -> tuple[dict, list[str]]:
-    last_hb = session.exec(
-        select(AuditLog)
-        .where(AuditLog.serial == serial, AuditLog.event == "heartbeat")
-        .order_by(AuditLog.created_at.desc())
-        .limit(1)
-    ).first()
+    last_hb = session.exec(select(AuditLog).where(AuditLog.serial == serial, AuditLog.event == "heartbeat").order_by(AuditLog.created_at.desc()).limit(1)).first()
     hb_detail = safe_json(last_hb.detail if last_hb else None)
     metrics = hb_detail.get("metrics") if isinstance(hb_detail.get("metrics"), dict) else {}
     apps = hb_detail.get("apps") if isinstance(hb_detail.get("apps"), list) else []
@@ -85,55 +123,45 @@ def normalized_device_status(device: Device) -> str:
 def portal_device_payload(device: Device, session: Session) -> dict:
     metrics, apps = latest_device_heartbeat(session, device.serial)
     last_seen = as_utc_naive(device.last_seen)
-    return {
-        "serial": device.serial,
-        "name": device.name,
-        "customer": device.customer,
-        "site": device.site,
-        "model": device.model,
-        "status": normalized_device_status(device),
-        "authorized": device.authorized,
-        "firmware": device.firmware,
-        "target_firmware": device.target_firmware,
-        "agent_version": metrics.get("agent_version"),
-        "hostname": metrics.get("hostname"),
-        "ip_address": device.ip_address,
-        "last_seen": last_seen.isoformat() if last_seen else None,
-        "apps": apps,
-        "metrics": {
-            "cpu_percent": metrics.get("cpu_percent"),
-            "mem_percent": metrics.get("mem_percent"),
-            "disk_percent": metrics.get("disk_percent"),
-        },
-        "zerotier": {
-            "node_id": device.zerotier_node_id,
-            "network_id": device.zerotier_network_id,
-        },
-    }
+    return {"serial": device.serial, "name": device.name, "customer": device.customer, "site": device.site, "model": device.model, "status": normalized_device_status(device), "authorized": device.authorized, "firmware": device.firmware, "target_firmware": device.target_firmware, "agent_version": metrics.get("agent_version"), "hostname": metrics.get("hostname"), "ip_address": device.ip_address, "last_seen": last_seen.isoformat() if last_seen else None, "apps": apps, "metrics": {"cpu_percent": metrics.get("cpu_percent"), "mem_percent": metrics.get("mem_percent"), "disk_percent": metrics.get("disk_percent")}, "zerotier": {"node_id": device.zerotier_node_id, "network_id": device.zerotier_network_id}}
 
 
-@app.get("/healthz")
+@app.get("/healthz", tags=["System"])
 def healthz():
     return {"ok": True, "service": "q-central"}
 
 
-@app.post("/api/auth/login")
+@app.post("/api/auth/login", tags=["Auth"])
 @limiter.limit("5/minute")
 def login(request: Request, response: Response, body: LoginRequest, session: Session = Depends(get_session)):
     ip = client_ip(request)
     supplied = getattr(body, "credential", None) or getattr(body, "password", None)
-    if not supplied or not authenticate_admin(body.username, supplied):
-        audit(session, "admin_login_failed", body.username, detail=ip)
+    user = session.get(User, body.username)
+    if user and user.is_active and supplied and verify_secret(supplied, user.credential_hash):
+        user.last_login_at = datetime.now(timezone.utc)
+        user.updated_at = datetime.now(timezone.utc)
+        session.add(user)
+        token = create_admin_session(user.username)
+        response.set_cookie(SESSION_COOKIE_NAME, token, httponly=True, secure=True, samesite="strict", max_age=settings.session_minutes * 60, path="/")
+        audit(session, "admin_login_success", user.username, detail=ip)
         session.commit()
-        raise HTTPException(status_code=401, detail="invalid login")
-    token = create_admin_session(body.username)
-    response.set_cookie(SESSION_COOKIE_NAME, token, httponly=True, secure=True, samesite="strict", max_age=settings.session_minutes * 60, path="/")
-    audit(session, "admin_login_success", body.username, detail=ip)
+        return {"ok": True, **user_payload(user), "expires_in": settings.session_minutes * 60}
+    if supplied and authenticate_admin(body.username, supplied):
+        user = get_or_bootstrap_user(session, body.username)
+        if user:
+            user.last_login_at = datetime.now(timezone.utc)
+            session.add(user)
+        token = create_admin_session(body.username)
+        response.set_cookie(SESSION_COOKIE_NAME, token, httponly=True, secure=True, samesite="strict", max_age=settings.session_minutes * 60, path="/")
+        audit(session, "admin_login_success", body.username, detail=ip)
+        session.commit()
+        return {"ok": True, **user_payload(user), "expires_in": settings.session_minutes * 60}
+    audit(session, "admin_login_failed", body.username, detail=ip)
     session.commit()
-    return {"ok": True, "username": body.username, "expires_in": settings.session_minutes * 60}
+    raise HTTPException(status_code=401, detail="invalid login")
 
 
-@app.post("/api/auth/logout")
+@app.post("/api/auth/logout", tags=["Auth"])
 def logout(response: Response, actor: str = Depends(require_admin), session: Session = Depends(get_session)):
     response.delete_cookie(SESSION_COOKIE_NAME, path="/")
     audit(session, "admin_logout", actor)
@@ -141,12 +169,86 @@ def logout(response: Response, actor: str = Depends(require_admin), session: Ses
     return {"ok": True}
 
 
-@app.get("/api/auth/me")
-def me(actor: str = Depends(require_admin)):
-    return {"username": actor, "role": "admin"}
+@app.get("/api/auth/me", tags=["Auth"])
+def me(actor: str = Depends(require_admin), session: Session = Depends(get_session)):
+    return user_payload(current_user(session, actor))
 
 
-@app.get("/api/portal/device/{serial}")
+@app.get("/api/profile", tags=["Profile"])
+def profile(actor: str = Depends(require_admin), session: Session = Depends(get_session)):
+    return user_payload(current_user(session, actor))
+
+
+@app.post("/api/profile/change-password", tags=["Profile"])
+def change_profile_password(body: ProfileUpdateRequest, actor: str = Depends(require_admin), session: Session = Depends(get_session)):
+    user = current_user(session, actor)
+    if not verify_secret(body.current_value, user.credential_hash):
+        raise HTTPException(status_code=401, detail="current credential is invalid")
+    if len(body.new_value) < 10:
+        raise HTTPException(status_code=400, detail="new credential must be at least 10 characters")
+    user.credential_hash = hash_secret(body.new_value)
+    user.updated_at = datetime.now(timezone.utc)
+    session.add(user)
+    audit(session, "profile_password_changed", actor)
+    session.commit()
+    return {"ok": True}
+
+
+@app.get("/api/users", tags=["RBAC"])
+def list_users(actor: str = Depends(require_admin), session: Session = Depends(get_session)):
+    require_admin_role(session, actor)
+    users = session.exec(select(User).order_by(User.username)).all()
+    return [user_payload(u) for u in users]
+
+
+@app.post("/api/users", tags=["RBAC"])
+def create_user(body: UserCreateRequest, actor: str = Depends(require_admin), session: Session = Depends(get_session)):
+    require_admin_role(session, actor)
+    if session.get(User, body.username):
+        raise HTTPException(status_code=409, detail="user already exists")
+    if body.role not in [r.value for r in UserRole]:
+        raise HTTPException(status_code=400, detail="invalid role")
+    if len(body.initial_value) < 10:
+        raise HTTPException(status_code=400, detail="initial credential must be at least 10 characters")
+    user = User(username=body.username, credential_hash=hash_secret(body.initial_value), role=UserRole(body.role), full_name=body.full_name, email=body.email, is_active=body.is_active)
+    session.add(user)
+    audit(session, "user_created", actor, detail=json.dumps({"username": body.username, "role": body.role})[:500])
+    session.commit()
+    session.refresh(user)
+    return user_payload(user)
+
+
+@app.patch("/api/users/{username}", tags=["RBAC"])
+def update_user(username: str, body: UserUpdateRequest, actor: str = Depends(require_admin), session: Session = Depends(get_session)):
+    require_admin_role(session, actor)
+    user = session.get(User, username)
+    if not user:
+        raise HTTPException(status_code=404, detail="user not found")
+    if body.role is not None:
+        if body.role not in [r.value for r in UserRole]:
+            raise HTTPException(status_code=400, detail="invalid role")
+        user.role = UserRole(body.role)
+    if body.full_name is not None:
+        user.full_name = body.full_name
+    if body.email is not None:
+        user.email = body.email
+    if body.is_active is not None:
+        if username == actor and not body.is_active:
+            raise HTTPException(status_code=400, detail="cannot disable yourself")
+        user.is_active = body.is_active
+    if body.new_value:
+        if len(body.new_value) < 10:
+            raise HTTPException(status_code=400, detail="new credential must be at least 10 characters")
+        user.credential_hash = hash_secret(body.new_value)
+    user.updated_at = datetime.now(timezone.utc)
+    session.add(user)
+    audit(session, "user_updated", actor, detail=json.dumps({"username": username})[:500])
+    session.commit()
+    session.refresh(user)
+    return user_payload(user)
+
+
+@app.get("/api/portal/device/{serial}", tags=["Portal API"])
 @limiter.limit("120/minute")
 def portal_device(request: Request, serial: str, session: Session = Depends(get_session), actor: str = Depends(require_portal_token)):
     device = session.get(Device, serial)
@@ -157,7 +259,7 @@ def portal_device(request: Request, serial: str, session: Session = Depends(get_
     return portal_device_payload(device, session)
 
 
-@app.get("/api/portal/devices")
+@app.get("/api/portal/devices", tags=["Portal API"])
 @limiter.limit("120/minute")
 def portal_devices(request: Request, customer: str | None = None, site: str | None = None, session: Session = Depends(get_session), actor: str = Depends(require_portal_token)):
     stmt = select(Device).order_by(Device.updated_at.desc())
@@ -171,7 +273,7 @@ def portal_devices(request: Request, customer: str | None = None, site: str | No
     return {"devices": [portal_device_payload(d, session) for d in devices], "count": len(devices)}
 
 
-@app.get("/api/portal/customer/{customer}/devices")
+@app.get("/api/portal/customer/{customer}/devices", tags=["Portal API"])
 @limiter.limit("120/minute")
 def portal_customer_devices(request: Request, customer: str, session: Session = Depends(get_session), actor: str = Depends(require_portal_token)):
     devices = session.exec(select(Device).where(Device.customer == customer).order_by(Device.updated_at.desc())).all()
@@ -180,7 +282,7 @@ def portal_customer_devices(request: Request, customer: str, session: Session = 
     return {"customer": customer, "devices": [portal_device_payload(d, session) for d in devices], "count": len(devices)}
 
 
-@app.post("/api/serials", response_model=RegisterSerialResponse)
+@app.post("/api/serials", response_model=RegisterSerialResponse, tags=["Devices"])
 @limiter.limit("30/minute")
 def register_serial(request: Request, body: RegisterSerialRequest, session: Session = Depends(get_session), actor: str = Depends(require_admin)):
     existing = session.get(Device, body.serial)
@@ -194,12 +296,12 @@ def register_serial(request: Request, body: RegisterSerialRequest, session: Sess
     return RegisterSerialResponse(serial=body.serial, claim_token=claim_token)
 
 
-@app.get("/api/devices")
+@app.get("/api/devices", tags=["Devices"])
 def list_devices(session: Session = Depends(get_session), actor: str = Depends(require_admin)):
     return session.exec(select(Device).order_by(Device.updated_at.desc())).all()
 
 
-@app.get("/api/monitoring/overview")
+@app.get("/api/monitoring/overview", tags=["Monitoring"])
 def monitoring_overview(session: Session = Depends(get_session), actor: str = Depends(require_admin)):
     devices = session.exec(select(Device).order_by(Device.updated_at.desc())).all()
     online_cutoff = datetime.utcnow() - timedelta(minutes=10)
@@ -235,7 +337,7 @@ def monitoring_overview(session: Session = Depends(get_session), actor: str = De
     return {"totals": totals, "devices": rows, "generated_at": datetime.utcnow().isoformat()}
 
 
-@app.post("/api/provision", response_model=ProvisionResponse)
+@app.post("/api/provision", response_model=ProvisionResponse, tags=["Agent"])
 @limiter.limit("20/minute")
 async def provision(request: Request, body: ProvisionRequest, session: Session = Depends(get_session)):
     device = session.get(Device, body.serial)
@@ -265,7 +367,7 @@ async def provision(request: Request, body: ProvisionRequest, session: Session =
     return ProvisionResponse(serial=device.serial, authorized=device.authorized, agent_token=agent_token, central_url=str(settings.external_url))
 
 
-@app.post("/api/agent/heartbeat")
+@app.post("/api/agent/heartbeat", tags=["Agent"])
 @limiter.limit("120/minute")
 def heartbeat(request: Request, body: HeartbeatRequest, session: Session = Depends(get_session), token: str = Depends(require_agent_token)):
     device = session.get(Device, body.serial)
@@ -283,7 +385,7 @@ def heartbeat(request: Request, body: HeartbeatRequest, session: Session = Depen
     return {"ok": True, "jobs": jobs}
 
 
-@app.post("/api/jobs")
+@app.post("/api/jobs", tags=["Jobs"])
 def create_job(body: JobCreateRequest, session: Session = Depends(get_session), actor: str = Depends(require_admin)):
     if body.kind not in ALLOWED_JOB_KINDS:
         raise HTTPException(status_code=400, detail=f"unsupported job kind: {body.kind}")
@@ -299,7 +401,7 @@ def create_job(body: JobCreateRequest, session: Session = Depends(get_session), 
     return job
 
 
-@app.post("/api/jobs/agent-update")
+@app.post("/api/jobs/agent-update", tags=["Jobs"])
 def create_agent_update_job(body: dict, session: Session = Depends(get_session), actor: str = Depends(require_admin)):
     required = {"serial", "url", "sha256"}
     missing = required - set(body)
@@ -319,7 +421,7 @@ def create_agent_update_job(body: dict, session: Session = Depends(get_session),
     return job
 
 
-@app.post("/api/jobs/app-update")
+@app.post("/api/jobs/app-update", tags=["Jobs"])
 def create_app_update_job(body: dict, session: Session = Depends(get_session), actor: str = Depends(require_admin)):
     required = {"serial", "path"}
     missing = required - set(body)
@@ -337,7 +439,7 @@ def create_app_update_job(body: dict, session: Session = Depends(get_session), a
     return job
 
 
-@app.post("/api/jobs/{job_id}/result")
+@app.post("/api/jobs/{job_id}/result", tags=["Jobs"])
 def job_result(job_id: int, result: dict, session: Session = Depends(get_session), token: str = Depends(require_agent_token)):
     job = session.get(Job, job_id)
     if not job:
