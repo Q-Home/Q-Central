@@ -52,6 +52,14 @@ def safe_json(value: str | None) -> dict:
         return {}
 
 
+def as_utc_naive(value):
+    if not value:
+        return None
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "service": "q-central"}
@@ -116,14 +124,15 @@ def list_devices(session: Session = Depends(get_session), actor: str = Depends(r
 @app.get("/api/monitoring/overview")
 def monitoring_overview(session: Session = Depends(get_session), actor: str = Depends(require_admin)):
     devices = session.exec(select(Device).order_by(Device.updated_at.desc())).all()
-    online_cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+    online_cutoff = datetime.utcnow() - timedelta(minutes=5)
     rows = []
     totals = {"devices": len(devices), "online": 0, "offline": 0, "pending": 0, "alerts": 0}
 
     for device in devices:
         if device.status == DeviceStatus.pending:
             totals["pending"] += 1
-        is_online = bool(device.last_seen and device.last_seen >= online_cutoff and device.status == DeviceStatus.online)
+        last_seen = as_utc_naive(device.last_seen)
+        is_online = bool(last_seen and last_seen >= online_cutoff and device.status == DeviceStatus.online)
         if is_online:
             totals["online"] += 1
         else:
@@ -152,7 +161,7 @@ def monitoring_overview(session: Session = Depends(get_session), actor: str = De
             "customer": device.customer,
             "site": device.site,
             "status": "online" if is_online else str(device.status.value if hasattr(device.status, "value") else device.status),
-            "last_seen": device.last_seen.isoformat() if device.last_seen else None,
+            "last_seen": last_seen.isoformat() if last_seen else None,
             "firmware": device.firmware,
             "ip_address": device.ip_address,
             "cpu_percent": cpu,
@@ -163,7 +172,7 @@ def monitoring_overview(session: Session = Depends(get_session), actor: str = De
             "apps": apps,
         })
 
-    return {"totals": totals, "devices": rows, "generated_at": datetime.now(timezone.utc).isoformat()}
+    return {"totals": totals, "devices": rows, "generated_at": datetime.utcnow().isoformat()}
 
 
 @app.post("/api/provision", response_model=ProvisionResponse)
