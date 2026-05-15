@@ -8,8 +8,37 @@
     Permissions-Policy "geolocation=(), microphone=(), camera=()"
   }
 
-  @api path /api/* /healthz /docs /docs/* /redoc /redoc/* /openapi.json
-  reverse_proxy @api api:8080
+  route {
+    handle_path /api/* {
+      reverse_proxy api:8080
+    }
 
-  reverse_proxy frontend:3000
+    handle /healthz {
+      reverse_proxy api:8080
+    }
+
+    handle /docs {
+      reverse_proxy api:8080
+    }
+
+    handle /docs/* {
+      reverse_proxy api:8080
+    }
+
+    handle /redoc {
+      reverse_proxy api:8080
+    }
+
+    handle /redoc/* {
+      reverse_proxy api:8080
+    }
+
+    handle /openapi.json {
+      reverse_proxy api:8080
+    }
+
+    handle {
+      reverse_proxy frontend:3000
+    }
+  }
 }
