@@ -10,11 +10,11 @@ from slowapi.middleware import SlowAPIMiddleware
 from .config import get_settings
 from .db import get_session, init_db
 from .models import AuditLog, Device, DeviceStatus, Job
-
-ALLOWED_JOB_KINDS = {"agent_update", "app_update", "app_restart", "compose_pull", "shell"}
 from .schemas import HeartbeatRequest, JobCreateRequest, ProvisionRequest, ProvisionResponse, RegisterSerialRequest, RegisterSerialResponse
 from .security import hash_secret, new_token, require_admin, require_agent_token, verify_secret
 from .zerotier import authorize_member
+
+ALLOWED_JOB_KINDS = {"agent_update", "app_update", "app_restart", "compose_pull"}
 
 settings = get_settings()
 limiter = Limiter(key_func=get_remote_address, default_limits=["240/minute"])
@@ -121,6 +121,8 @@ def heartbeat(request: Request, body: HeartbeatRequest, session: Session = Depen
 def create_job(body: JobCreateRequest, session: Session = Depends(get_session), actor: str = Depends(require_admin)):
     if body.kind not in ALLOWED_JOB_KINDS:
         raise HTTPException(status_code=400, detail=f"unsupported job kind: {body.kind}")
+    if body.kind == "agent_update" and not body.payload.get("sha256"):
+        raise HTTPException(status_code=400, detail="sha256 is required for agent_update jobs")
     if not session.get(Device, body.serial):
         raise HTTPException(status_code=404, detail="device not found")
     job = Job(serial=body.serial, kind=body.kind, payload_json=json.dumps(body.payload))
@@ -133,14 +135,16 @@ def create_job(body: JobCreateRequest, session: Session = Depends(get_session), 
 
 @app.post("/api/jobs/agent-update")
 def create_agent_update_job(body: dict, session: Session = Depends(get_session), actor: str = Depends(require_admin)):
-    required = {"serial", "url"}
+    required = {"serial", "url", "sha256"}
     missing = required - set(body)
     if missing:
         raise HTTPException(status_code=400, detail=f"missing fields: {sorted(missing)}")
+    if not str(body.get("sha256") or "").strip():
+        raise HTTPException(status_code=400, detail="sha256 is required")
     serial = body["serial"]
     if not session.get(Device, serial):
         raise HTTPException(status_code=404, detail="device not found")
-    payload = {"url": body["url"], "sha256": body.get("sha256"), "version": body.get("version")}
+    payload = {"url": body["url"], "sha256": body["sha256"], "version": body.get("version")}
     job = Job(serial=serial, kind="agent_update", payload_json=json.dumps(payload))
     session.add(job)
     audit(session, "agent_update_queued", actor, serial, json.dumps(payload))
