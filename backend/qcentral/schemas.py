@@ -4,7 +4,8 @@ from typing import Any
 
 class LoginRequest(BaseModel):
     username: str
-    credential: str
+    password: str | None = None
+    credential: str | None = None
     code: str | None = None
 
 
