@@ -2,6 +2,12 @@ from pydantic import BaseModel
 from typing import Any
 
 
+class LoginRequest(BaseModel):
+    username: str
+    credential: str
+    code: str | None = None
+
+
 class RegisterSerialRequest(BaseModel):
     serial: str
     customer: str | None = None
