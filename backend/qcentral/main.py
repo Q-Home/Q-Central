@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session, select
@@ -42,6 +42,16 @@ def client_ip(request: Request) -> str:
     return request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
 
 
+def safe_json(value: str | None) -> dict:
+    if not value:
+        return {}
+    try:
+        data = json.loads(value)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "service": "q-central"}
@@ -51,7 +61,8 @@ def healthz():
 @limiter.limit("5/minute")
 def login(request: Request, response: Response, body: LoginRequest, session: Session = Depends(get_session)):
     ip = client_ip(request)
-    if not authenticate_admin(body.username, body.password):
+    supplied = getattr(body, "credential", None) or getattr(body, "password", None)
+    if not supplied or not authenticate_admin(body.username, supplied):
         audit(session, "admin_login_failed", body.username, detail=ip)
         session.commit()
         raise HTTPException(status_code=401, detail="invalid login")
@@ -100,6 +111,59 @@ def register_serial(request: Request, body: RegisterSerialRequest, session: Sess
 @app.get("/api/devices")
 def list_devices(session: Session = Depends(get_session), actor: str = Depends(require_admin)):
     return session.exec(select(Device).order_by(Device.updated_at.desc())).all()
+
+
+@app.get("/api/monitoring/overview")
+def monitoring_overview(session: Session = Depends(get_session), actor: str = Depends(require_admin)):
+    devices = session.exec(select(Device).order_by(Device.updated_at.desc())).all()
+    online_cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+    rows = []
+    totals = {"devices": len(devices), "online": 0, "offline": 0, "pending": 0, "alerts": 0}
+
+    for device in devices:
+        if device.status == DeviceStatus.pending:
+            totals["pending"] += 1
+        is_online = bool(device.last_seen and device.last_seen >= online_cutoff and device.status == DeviceStatus.online)
+        if is_online:
+            totals["online"] += 1
+        else:
+            totals["offline"] += 1
+
+        last_hb = session.exec(
+            select(AuditLog)
+            .where(AuditLog.serial == device.serial, AuditLog.event == "heartbeat")
+            .order_by(AuditLog.created_at.desc())
+            .limit(1)
+        ).first()
+        hb_detail = safe_json(last_hb.detail if last_hb else None)
+        metrics = hb_detail.get("metrics") if isinstance(hb_detail.get("metrics"), dict) else {}
+        apps = hb_detail.get("apps") if isinstance(hb_detail.get("apps"), list) else []
+        cpu = metrics.get("cpu_percent")
+        mem = metrics.get("mem_percent")
+        disk = metrics.get("disk_percent")
+        if any(isinstance(v, (int, float)) and v >= 90 for v in [cpu, mem, disk]):
+            totals["alerts"] += 1
+        if not is_online:
+            totals["alerts"] += 1
+
+        rows.append({
+            "serial": device.serial,
+            "name": device.name,
+            "customer": device.customer,
+            "site": device.site,
+            "status": "online" if is_online else str(device.status.value if hasattr(device.status, "value") else device.status),
+            "last_seen": device.last_seen.isoformat() if device.last_seen else None,
+            "firmware": device.firmware,
+            "ip_address": device.ip_address,
+            "cpu_percent": cpu,
+            "mem_percent": mem,
+            "disk_percent": disk,
+            "agent_version": metrics.get("agent_version"),
+            "hostname": metrics.get("hostname"),
+            "apps": apps,
+        })
+
+    return {"totals": totals, "devices": rows, "generated_at": datetime.now(timezone.utc).isoformat()}
 
 
 @app.post("/api/provision", response_model=ProvisionResponse)
