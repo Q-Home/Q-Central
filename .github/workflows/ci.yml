@@ -14,6 +14,7 @@ jobs:
       - run: python -m compileall backend/qcentral agent/qbox_agent
       - run: bash -n scripts/*.sh
       - run: bash -n agent/*.sh
+      - run: touch deploy/.env
       - run: docker compose -f deploy/docker-compose.production.yml config
 
   frontend:
