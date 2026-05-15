@@ -6,6 +6,7 @@ SERIAL=""
 CLAIM_TOKEN=""
 MODEL="Q-Box ARM64"
 VERSION="dev"
+RELEASE_URL=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -14,6 +15,7 @@ while [[ $# -gt 0 ]]; do
     --claim-token) CLAIM_TOKEN="${2:-}"; shift 2 ;;
     --model) MODEL="${2:-}"; shift 2 ;;
     --version) VERSION="${2:-}"; shift 2 ;;
+    --release-url) RELEASE_URL="${2:-}"; shift 2 ;;
     *) echo "Unknown arg $1" >&2; exit 1 ;;
   esac
 done
@@ -22,21 +24,33 @@ done
 [[ $EUID -eq 0 ]] || { echo "Run as root" >&2; exit 1; }
 
 apt-get update
-apt-get install -y python3 python3-venv python3-pip curl rsync systemd
+apt-get install -y python3 python3-venv python3-pip curl rsync systemd tar
 install -d -m 700 /etc/qbox-agent
 install -d -m 755 /opt/qbox-agent
 python3 -m venv /opt/qbox-agent/venv
 /opt/qbox-agent/venv/bin/pip install --upgrade pip
 
+WORKDIR="$(mktemp -d /tmp/qbox-agent-install.XXXXXX)"
+trap 'rm -rf "$WORKDIR"' EXIT
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -d "$SCRIPT_DIR/qbox_agent" ]]; then
-  rsync -a --delete "$SCRIPT_DIR/qbox_agent" /opt/qbox-agent/
-  cp "$SCRIPT_DIR/requirements.txt" /opt/qbox-agent/requirements.txt
-  cp "$SCRIPT_DIR/update-agent.sh" /opt/qbox-agent/update-agent.sh
+  SRC="$SCRIPT_DIR"
+elif [[ -n "$RELEASE_URL" ]]; then
+  ARCHIVE="$WORKDIR/agent.tar.gz"
+  curl -fsSL "$RELEASE_URL" -o "$ARCHIVE"
+  tar -xzf "$ARCHIVE" -C "$WORKDIR"
+  SRC="$(find "$WORKDIR" -maxdepth 3 -type d -name qbox_agent -print -quit | xargs -r dirname)"
 else
-  echo "Local qbox_agent package not found next to install.sh. Install from release archive instead." >&2
+  echo "Missing local qbox_agent package and no --release-url supplied" >&2
   exit 2
 fi
+
+[[ -n "${SRC:-}" && -d "$SRC/qbox_agent" ]] || { echo "Could not find qbox_agent package" >&2; exit 3; }
+
+rsync -a --delete "$SRC/qbox_agent" /opt/qbox-agent/
+cp "$SRC/requirements.txt" /opt/qbox-agent/requirements.txt
+cp "$SRC/update-agent.sh" /opt/qbox-agent/update-agent.sh
 chmod +x /opt/qbox-agent/update-agent.sh
 /opt/qbox-agent/venv/bin/pip install -r /opt/qbox-agent/requirements.txt
 
@@ -48,8 +62,7 @@ cat >/etc/qbox-agent/config.json <<JSON
   "claim_token": "$CLAIM_TOKEN",
   "model": "$MODEL",
   "firmware": "$VERSION",
-  "interval": 60,
-  "allow_shell_jobs": false
+  "interval": 60
 }
 JSON
 chmod 600 /etc/qbox-agent/config.json
