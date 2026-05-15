@@ -10,18 +10,20 @@ class Settings(BaseSettings):
     external_url: AnyHttpUrl = "https://q-central.zt.q-home.local"
     db_path: str = "/data/qcentral.db"
     secret_key: str = Field(min_length=32)
-    admin_token: str = Field(min_length=32)
+    admin_username: str = "admin"
+    admin_credential_hash: str = Field(min_length=20)
+    session_minutes: int = 480
     cors_origins: str = "https://q-central.zt.q-home.local"
     zerotier_network_id: str | None = None
     zerotier_api_token: str | None = None
     auto_authorize: bool = True
     log_level: str = "INFO"
 
-    @field_validator("secret_key", "admin_token")
+    @field_validator("secret_key", "admin_credential_hash")
     @classmethod
     def reject_defaults(cls, value: str) -> str:
         if value.startswith("change-me") or value.startswith("replace-"):
-            raise ValueError("production secrets must be changed")
+            raise ValueError("production credential values must be changed")
         return value
 
     @property
