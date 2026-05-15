@@ -1,27 +1,24 @@
 services:
-  central-api:
-    build: ../central-api
-    container_name: qbox-central-api
-    environment:
-      QBOX_DB: /data/central.db
-      QBOX_AUTO_AUTHORIZE: ${QBOX_AUTO_AUTHORIZE:-true}
-      QBOX_ZEROTIER_NETWORK_ID: ${QBOX_ZEROTIER_NETWORK_ID:-8056c2e21c000001}
+  api:
+    build: ../backend
+    container_name: q-central-api
+    env_file: .env
     volumes:
-      - central-data:/data
+      - qcentral-data:/data
     ports:
       - "8080:8080"
     restart: unless-stopped
 
-  central-web:
-    build: ../central-web
-    container_name: qbox-central-web
+  frontend:
+    build: ../frontend
+    container_name: q-central-web
     environment:
-      VITE_API_URL: ${VITE_API_URL:-http://localhost:8080}
+      VITE_API_URL: ${Q_CENTRAL_EXTERNAL_URL:-http://localhost:8080}
     ports:
       - "5173:5173"
     depends_on:
-      - central-api
+      - api
     restart: unless-stopped
 
 volumes:
-  central-data:
+  qcentral-data:
