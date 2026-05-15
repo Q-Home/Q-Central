@@ -7,7 +7,12 @@
     Referrer-Policy "no-referrer"
     Permissions-Policy "geolocation=(), microphone=(), camera=()"
   }
+
   reverse_proxy /api/* api:8080
   reverse_proxy /healthz api:8080
+  reverse_proxy /docs* api:8080
+  reverse_proxy /redoc* api:8080
+  reverse_proxy /openapi.json api:8080
+
   reverse_proxy frontend:3000
 }
