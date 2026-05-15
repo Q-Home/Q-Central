@@ -9,6 +9,28 @@ class LoginRequest(BaseModel):
     code: str | None = None
 
 
+class ProfileUpdateRequest(BaseModel):
+    current_value: str
+    new_value: str
+
+
+class UserCreateRequest(BaseModel):
+    username: str
+    initial_value: str
+    role: str = "readonly"
+    full_name: str | None = None
+    email: str | None = None
+    is_active: bool = True
+
+
+class UserUpdateRequest(BaseModel):
+    role: str | None = None
+    full_name: str | None = None
+    email: str | None = None
+    is_active: bool | None = None
+    new_value: str | None = None
+
+
 class RegisterSerialRequest(BaseModel):
     serial: str
     customer: str | None = None
