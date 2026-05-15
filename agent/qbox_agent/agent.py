@@ -1,7 +1,6 @@
 import argparse
 import json
 import os
-import shlex
 import socket
 import subprocess
 import time
@@ -132,7 +131,6 @@ def job_compose_pull(payload):
 
 
 def job_app_update(payload):
-    # App update is intentionally compose-based: pull exact image tags and redeploy one app bundle.
     return job_compose_pull(payload)
 
 
@@ -147,26 +145,15 @@ def job_app_restart(payload):
 
 def job_agent_update(payload):
     url = payload.get('url')
-    if not url:
-        raise ValueError('url is required')
     sha256 = payload.get('sha256')
+    if not url or not sha256:
+        raise ValueError('url and sha256 are required')
     version = payload.get('version')
-    cmd = ['systemd-run', '--unit=qbox-agent-self-update', '--collect', '/opt/qbox-agent/update-agent.sh', '--url', url]
-    if sha256:
-        cmd += ['--sha256', sha256]
+    cmd = ['systemd-run', '--unit=qbox-agent-self-update', '--collect', '/opt/qbox-agent/update-agent.sh', '--url', url, '--sha256', sha256]
     if version:
         cmd += ['--version', version]
     rc, out = run_checked(cmd, timeout=60)
     return ('accepted' if rc == 0 else 'failed'), out or 'self-update scheduled through systemd-run'
-
-
-def job_shell(payload, cfg):
-    if not cfg.get('allow_shell_jobs', False):
-        return 'rejected', 'shell jobs disabled'
-    cmd = payload.get('cmd', '')
-    if not cmd:
-        return 'failed', 'cmd is required'
-    return 'done', sh(cmd, timeout=int(payload.get('timeout', 300)))
 
 
 def run_job(cfg, token, job):
@@ -182,8 +169,6 @@ def run_job(cfg, token, job):
             status, output = job_app_restart(payload)
         elif kind == 'compose_pull':
             status, output = job_compose_pull(payload)
-        elif kind == 'shell':
-            status, output = job_shell(payload, cfg)
         else:
             status, output = 'unknown', f'unknown job kind: {kind}'
     except Exception as exc:
