@@ -124,16 +124,25 @@ def list_devices(session: Session = Depends(get_session), actor: str = Depends(r
 @app.get("/api/monitoring/overview")
 def monitoring_overview(session: Session = Depends(get_session), actor: str = Depends(require_admin)):
     devices = session.exec(select(Device).order_by(Device.updated_at.desc())).all()
-    online_cutoff = datetime.utcnow() - timedelta(minutes=5)
+    online_cutoff = datetime.utcnow() - timedelta(minutes=10)
     rows = []
-    totals = {"devices": len(devices), "online": 0, "offline": 0, "pending": 0, "alerts": 0}
+    totals = {"devices": len(devices), "online": 0, "offline": 0, "stale": 0, "pending": 0, "alerts": 0}
 
     for device in devices:
-        if device.status == DeviceStatus.pending:
-            totals["pending"] += 1
         last_seen = as_utc_naive(device.last_seen)
-        is_online = bool(last_seen and last_seen >= online_cutoff and device.status == DeviceStatus.online)
-        if is_online:
+        db_status = device.status.value if hasattr(device.status, "value") else str(device.status)
+        is_db_online = device.status == DeviceStatus.online or db_status == "online"
+        is_recent = bool(last_seen and last_seen >= online_cutoff)
+        is_pending = device.status == DeviceStatus.pending or db_status == "pending"
+        is_stale = bool(is_db_online and last_seen and not is_recent)
+        is_online = bool(is_db_online and (is_recent or last_seen is None))
+
+        if is_pending:
+            totals["pending"] += 1
+        elif is_stale:
+            totals["stale"] += 1
+            totals["online"] += 1
+        elif is_online:
             totals["online"] += 1
         else:
             totals["offline"] += 1
@@ -152,15 +161,16 @@ def monitoring_overview(session: Session = Depends(get_session), actor: str = De
         disk = metrics.get("disk_percent")
         if any(isinstance(v, (int, float)) and v >= 90 for v in [cpu, mem, disk]):
             totals["alerts"] += 1
-        if not is_online:
+        if is_stale or (not is_online and not is_pending):
             totals["alerts"] += 1
 
+        row_status = "stale" if is_stale else "online" if is_online else db_status
         rows.append({
             "serial": device.serial,
             "name": device.name,
             "customer": device.customer,
             "site": device.site,
-            "status": "online" if is_online else str(device.status.value if hasattr(device.status, "value") else device.status),
+            "status": row_status,
             "last_seen": last_seen.isoformat() if last_seen else None,
             "firmware": device.firmware,
             "ip_address": device.ip_address,
