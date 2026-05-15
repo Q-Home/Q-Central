@@ -8,13 +8,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: {python-version: '3.12'}
+        with:
+          python-version: '3.12'
       - run: pip install -r backend/requirements.txt
       - run: python -m compileall backend/qcentral agent/qbox_agent
+      - run: bash -n scripts/*.sh
+      - run: bash -n agent/*.sh
+      - run: docker compose -f deploy/docker-compose.production.yml config
+
   frontend:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: {node-version: '22'}
+        with:
+          node-version: '22'
       - run: cd frontend && npm install && npm run build
