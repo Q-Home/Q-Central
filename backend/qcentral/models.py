@@ -14,6 +14,28 @@ class DeviceStatus(str, Enum):
     disabled = "disabled"
 
 
+class UserRole(str, Enum):
+    superadmin = "superadmin"
+    admin = "admin"
+    support = "support"
+    installer = "installer"
+    readonly = "readonly"
+
+
+class User(SQLModel, table=True):
+    username: str = Field(primary_key=True, index=True)
+    credential_hash: str
+    role: UserRole = UserRole.admin
+    full_name: str | None = None
+    email: str | None = None
+    is_active: bool = True
+    mfa_enabled: bool = False
+    mfa_seed: str | None = None
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)
+    last_login_at: datetime | None = None
+
+
 class Device(SQLModel, table=True):
     serial: str = Field(primary_key=True, index=True)
     claim_token_hash: str
