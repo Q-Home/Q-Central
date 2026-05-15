@@ -1,3 +1,4 @@
+import os
 import secrets
 from datetime import datetime, timedelta, timezone
 
@@ -66,3 +67,18 @@ def require_agent_token(x_agent_token: str | None = Header(default=None)) -> str
     if not x_agent_token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="missing agent token")
     return x_agent_token
+
+
+def require_portal_token(
+    authorization: str | None = Header(default=None),
+    x_portal_token: str | None = Header(default=None),
+) -> str:
+    expected_hash = os.getenv("Q_CENTRAL_PORTAL_TOKEN_HASH")
+    if not expected_hash:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="portal api not configured")
+    supplied = x_portal_token
+    if authorization and authorization.lower().startswith("bearer "):
+        supplied = authorization.split(" ", 1)[1].strip()
+    if not supplied or not verify_secret(supplied, expected_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid portal token")
+    return "q-portal"
