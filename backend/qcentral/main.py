@@ -11,7 +11,7 @@ from .config import get_settings
 from .db import get_session, init_db
 from .models import AuditLog, Device, DeviceStatus, Job
 from .schemas import HeartbeatRequest, JobCreateRequest, LoginRequest, ProvisionRequest, ProvisionResponse, RegisterSerialRequest, RegisterSerialResponse
-from .security import SESSION_COOKIE_NAME, authenticate_admin, create_admin_session, hash_secret, new_token, require_admin, require_agent_token, verify_secret
+from .security import SESSION_COOKIE_NAME, authenticate_admin, create_admin_session, hash_secret, new_token, require_admin, require_agent_token, require_portal_token, verify_secret
 from .zerotier import authorize_member
 
 ALLOWED_JOB_KINDS = {"agent_update", "app_update", "app_restart", "compose_pull"}
@@ -21,7 +21,7 @@ limiter = Limiter(key_func=get_remote_address, default_limits=["240/minute"])
 app = FastAPI(title="Q-Central API", version="1.0.0")
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
-app.add_middleware(CORSMiddleware, allow_origins=settings.cors_list, allow_credentials=True, allow_methods=["GET", "POST", "PATCH"], allow_headers=["Content-Type", "Authorization", "X-Agent-Token"])
+app.add_middleware(CORSMiddleware, allow_origins=settings.cors_list, allow_credentials=True, allow_methods=["GET", "POST", "PATCH"], allow_headers=["Content-Type", "Authorization", "X-Agent-Token", "X-Portal-Token"])
 
 
 @app.exception_handler(RateLimitExceeded)
@@ -60,6 +60,58 @@ def as_utc_naive(value):
     return value
 
 
+def latest_device_heartbeat(session: Session, serial: str) -> tuple[dict, list[str]]:
+    last_hb = session.exec(
+        select(AuditLog)
+        .where(AuditLog.serial == serial, AuditLog.event == "heartbeat")
+        .order_by(AuditLog.created_at.desc())
+        .limit(1)
+    ).first()
+    hb_detail = safe_json(last_hb.detail if last_hb else None)
+    metrics = hb_detail.get("metrics") if isinstance(hb_detail.get("metrics"), dict) else {}
+    apps = hb_detail.get("apps") if isinstance(hb_detail.get("apps"), list) else []
+    return metrics, apps
+
+
+def normalized_device_status(device: Device) -> str:
+    last_seen = as_utc_naive(device.last_seen)
+    online_cutoff = datetime.utcnow() - timedelta(minutes=10)
+    db_status = device.status.value if hasattr(device.status, "value") else str(device.status)
+    if db_status == "online" and last_seen and last_seen < online_cutoff:
+        return "stale"
+    return db_status
+
+
+def portal_device_payload(device: Device, session: Session) -> dict:
+    metrics, apps = latest_device_heartbeat(session, device.serial)
+    last_seen = as_utc_naive(device.last_seen)
+    return {
+        "serial": device.serial,
+        "name": device.name,
+        "customer": device.customer,
+        "site": device.site,
+        "model": device.model,
+        "status": normalized_device_status(device),
+        "authorized": device.authorized,
+        "firmware": device.firmware,
+        "target_firmware": device.target_firmware,
+        "agent_version": metrics.get("agent_version"),
+        "hostname": metrics.get("hostname"),
+        "ip_address": device.ip_address,
+        "last_seen": last_seen.isoformat() if last_seen else None,
+        "apps": apps,
+        "metrics": {
+            "cpu_percent": metrics.get("cpu_percent"),
+            "mem_percent": metrics.get("mem_percent"),
+            "disk_percent": metrics.get("disk_percent"),
+        },
+        "zerotier": {
+            "node_id": device.zerotier_node_id,
+            "network_id": device.zerotier_network_id,
+        },
+    }
+
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "service": "q-central"}
@@ -75,15 +127,7 @@ def login(request: Request, response: Response, body: LoginRequest, session: Ses
         session.commit()
         raise HTTPException(status_code=401, detail="invalid login")
     token = create_admin_session(body.username)
-    response.set_cookie(
-        SESSION_COOKIE_NAME,
-        token,
-        httponly=True,
-        secure=True,
-        samesite="strict",
-        max_age=settings.session_minutes * 60,
-        path="/",
-    )
+    response.set_cookie(SESSION_COOKIE_NAME, token, httponly=True, secure=True, samesite="strict", max_age=settings.session_minutes * 60, path="/")
     audit(session, "admin_login_success", body.username, detail=ip)
     session.commit()
     return {"ok": True, "username": body.username, "expires_in": settings.session_minutes * 60}
@@ -100,6 +144,40 @@ def logout(response: Response, actor: str = Depends(require_admin), session: Ses
 @app.get("/api/auth/me")
 def me(actor: str = Depends(require_admin)):
     return {"username": actor, "role": "admin"}
+
+
+@app.get("/api/portal/device/{serial}")
+@limiter.limit("120/minute")
+def portal_device(request: Request, serial: str, session: Session = Depends(get_session), actor: str = Depends(require_portal_token)):
+    device = session.get(Device, serial)
+    if not device:
+        raise HTTPException(status_code=404, detail="device not found")
+    audit(session, "portal_device_lookup", actor, serial, client_ip(request))
+    session.commit()
+    return portal_device_payload(device, session)
+
+
+@app.get("/api/portal/devices")
+@limiter.limit("120/minute")
+def portal_devices(request: Request, customer: str | None = None, site: str | None = None, session: Session = Depends(get_session), actor: str = Depends(require_portal_token)):
+    stmt = select(Device).order_by(Device.updated_at.desc())
+    if customer:
+        stmt = stmt.where(Device.customer == customer)
+    if site:
+        stmt = stmt.where(Device.site == site)
+    devices = session.exec(stmt).all()
+    audit(session, "portal_devices_lookup", actor, detail=json.dumps({"customer": customer, "site": site, "count": len(devices), "ip": client_ip(request)})[:500])
+    session.commit()
+    return {"devices": [portal_device_payload(d, session) for d in devices], "count": len(devices)}
+
+
+@app.get("/api/portal/customer/{customer}/devices")
+@limiter.limit("120/minute")
+def portal_customer_devices(request: Request, customer: str, session: Session = Depends(get_session), actor: str = Depends(require_portal_token)):
+    devices = session.exec(select(Device).where(Device.customer == customer).order_by(Device.updated_at.desc())).all()
+    audit(session, "portal_customer_lookup", actor, detail=json.dumps({"customer": customer, "count": len(devices), "ip": client_ip(request)})[:500])
+    session.commit()
+    return {"customer": customer, "devices": [portal_device_payload(d, session) for d in devices], "count": len(devices)}
 
 
 @app.post("/api/serials", response_model=RegisterSerialResponse)
@@ -127,7 +205,6 @@ def monitoring_overview(session: Session = Depends(get_session), actor: str = De
     online_cutoff = datetime.utcnow() - timedelta(minutes=10)
     rows = []
     totals = {"devices": len(devices), "online": 0, "offline": 0, "stale": 0, "pending": 0, "alerts": 0}
-
     for device in devices:
         last_seen = as_utc_naive(device.last_seen)
         db_status = device.status.value if hasattr(device.status, "value") else str(device.status)
@@ -136,7 +213,6 @@ def monitoring_overview(session: Session = Depends(get_session), actor: str = De
         is_pending = device.status == DeviceStatus.pending or db_status == "pending"
         is_stale = bool(is_db_online and last_seen and not is_recent)
         is_online = bool(is_db_online and (is_recent or last_seen is None))
-
         if is_pending:
             totals["pending"] += 1
         elif is_stale:
@@ -146,16 +222,7 @@ def monitoring_overview(session: Session = Depends(get_session), actor: str = De
             totals["online"] += 1
         else:
             totals["offline"] += 1
-
-        last_hb = session.exec(
-            select(AuditLog)
-            .where(AuditLog.serial == device.serial, AuditLog.event == "heartbeat")
-            .order_by(AuditLog.created_at.desc())
-            .limit(1)
-        ).first()
-        hb_detail = safe_json(last_hb.detail if last_hb else None)
-        metrics = hb_detail.get("metrics") if isinstance(hb_detail.get("metrics"), dict) else {}
-        apps = hb_detail.get("apps") if isinstance(hb_detail.get("apps"), list) else []
+        metrics, apps = latest_device_heartbeat(session, device.serial)
         cpu = metrics.get("cpu_percent")
         mem = metrics.get("mem_percent")
         disk = metrics.get("disk_percent")
@@ -163,25 +230,8 @@ def monitoring_overview(session: Session = Depends(get_session), actor: str = De
             totals["alerts"] += 1
         if is_stale or (not is_online and not is_pending):
             totals["alerts"] += 1
-
         row_status = "stale" if is_stale else "online" if is_online else db_status
-        rows.append({
-            "serial": device.serial,
-            "name": device.name,
-            "customer": device.customer,
-            "site": device.site,
-            "status": row_status,
-            "last_seen": last_seen.isoformat() if last_seen else None,
-            "firmware": device.firmware,
-            "ip_address": device.ip_address,
-            "cpu_percent": cpu,
-            "mem_percent": mem,
-            "disk_percent": disk,
-            "agent_version": metrics.get("agent_version"),
-            "hostname": metrics.get("hostname"),
-            "apps": apps,
-        })
-
+        rows.append({"serial": device.serial, "name": device.name, "customer": device.customer, "site": device.site, "status": row_status, "last_seen": last_seen.isoformat() if last_seen else None, "firmware": device.firmware, "ip_address": device.ip_address, "cpu_percent": cpu, "mem_percent": mem, "disk_percent": disk, "agent_version": metrics.get("agent_version"), "hostname": metrics.get("hostname"), "apps": apps})
     return {"totals": totals, "devices": rows, "generated_at": datetime.utcnow().isoformat()}
 
 
