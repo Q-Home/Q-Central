@@ -1,6 +1,7 @@
+import argparse
 import json
 import os
-import platform
+import shlex
 import socket
 import subprocess
 import time
@@ -9,104 +10,218 @@ from pathlib import Path
 import psutil
 import requests
 
-SERIAL = os.getenv("QBOX_SERIAL", Path("/etc/qbox/serial").read_text().strip() if Path("/etc/qbox/serial").exists() else "QBX-DEV-0000")
-CLAIM_TOKEN = os.getenv("QBOX_CLAIM_TOKEN", Path("/etc/qbox/claim_token").read_text().strip() if Path("/etc/qbox/claim_token").exists() else "dev-claim-token")
-CENTRAL_URL = os.getenv("QBOX_CENTRAL_URL", "http://qbox-central:8080").rstrip("/")
-FIRMWARE = os.getenv("QBOX_FIRMWARE", "dev")
-INTERVAL = int(os.getenv("QBOX_HEARTBEAT_INTERVAL", "30"))
+CONFIG = Path('/etc/qbox-agent/config.json')
+TOKEN = Path('/etc/qbox-agent/agent-token')
+VERSION_FILE = Path('/etc/qbox-agent/version')
+LOCK = Path('/run/qbox-agent-job.lock')
 
 
-def run(cmd):
+def sh(cmd, timeout=120):
     try:
-        return subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL).strip()
-    except Exception:
-        return None
+        return subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.STDOUT, timeout=timeout).strip()
+    except subprocess.CalledProcessError as exc:
+        return (exc.output or str(exc)).strip()
+    except Exception as exc:
+        return str(exc)
 
 
-def zerotier_info():
-    node_id = run("zerotier-cli info | awk '{print $3}'")
-    ip = run("ip -4 addr show | awk '/zt/{getline; print $2}' | cut -d/ -f1 | head -n1")
-    return node_id, ip
+def run_checked(args, timeout=300, cwd=None):
+    proc = subprocess.run(args, text=True, capture_output=True, timeout=timeout, check=False, cwd=cwd)
+    output = (proc.stdout or '') + (proc.stderr or '')
+    return proc.returncode, output.strip()
+
+
+def load():
+    return json.loads(CONFIG.read_text())
+
+
+def agent_version(cfg):
+    if VERSION_FILE.exists():
+        return VERSION_FILE.read_text().strip()
+    return cfg.get('agent_version', 'unknown')
+
+
+def zerotier_node_id():
+    out = sh('zerotier-cli info 2>/dev/null', timeout=5)
+    parts = out.split()
+    return parts[2] if len(parts) >= 3 else None
+
+
+def ip_addr():
+    return sh("hostname -I | awk '{print $1}'", timeout=5) or None
 
 
 def installed_apps():
-    # Prefer qbox app manifests. Fall back to Docker compose labels/names.
-    manifest_dir = Path("/etc/qbox/apps.d")
-    if manifest_dir.exists():
-        return sorted([p.stem for p in manifest_dir.glob("*.json")])
-    names = run("docker ps --format '{{.Names}}' 2>/dev/null")
-    return sorted([x for x in (names or "").splitlines() if x])
+    out = sh('docker ps --format {{.Names}} 2>/dev/null', timeout=10)
+    return [x for x in out.splitlines() if x]
 
 
 def metrics():
     return {
-        "hostname": socket.gethostname(),
-        "cpu_percent": psutil.cpu_percent(interval=0.2),
-        "memory_percent": psutil.virtual_memory().percent,
-        "disk_percent": psutil.disk_usage('/').percent,
-        "uptime_seconds": int(time.time() - psutil.boot_time()),
+        'hostname': socket.gethostname(),
+        'cpu_percent': psutil.cpu_percent(),
+        'mem_percent': psutil.virtual_memory().percent,
+        'disk_percent': psutil.disk_usage('/').percent,
+        'agent_version': agent_version(load()),
     }
 
 
-def provision():
-    zt_node, zt_ip = zerotier_info()
+def provision(cfg):
     payload = {
-        "serial": SERIAL,
-        "claim_token": CLAIM_TOKEN,
-        "hostname": socket.gethostname(),
-        "model": platform.platform(),
-        "firmware": FIRMWARE,
-        "zerotier_node_id": zt_node,
-        "zerotier_ip": zt_ip,
-        "metadata": {"python": platform.python_version()},
+        'serial': cfg['serial'],
+        'claim_token': cfg['claim_token'],
+        'model': cfg.get('model'),
+        'firmware': cfg.get('firmware', agent_version(cfg)),
+        'zerotier_node_id': zerotier_node_id(),
+        'ip_address': ip_addr(),
     }
-    r = requests.post(f"{CENTRAL_URL}/api/provision/request", json=payload, timeout=10)
+    r = requests.post(cfg['central_url'].rstrip('/') + '/api/provision', json=payload, timeout=15)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    TOKEN.write_text(data['agent_token'])
+    TOKEN.chmod(0o600)
+    cfg.pop('claim_token', None)
+    CONFIG.write_text(json.dumps(cfg, indent=2))
+    return data
 
 
-def heartbeat():
+def report_job_result(cfg, token, job_id, status, output):
+    requests.post(
+        cfg['central_url'].rstrip('/') + f'/api/jobs/{job_id}/result',
+        headers={'X-Agent-Token': token},
+        json={'status': status, 'output': str(output)[-6000:]},
+        timeout=20,
+    ).raise_for_status()
+
+
+def acquire_lock():
+    if LOCK.exists():
+        raise RuntimeError('another qbox-agent job is already running')
+    LOCK.write_text(str(os.getpid()))
+
+
+def release_lock():
+    try:
+        LOCK.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def validate_compose_path(path):
+    allowed_roots = ['/storage/dockers', '/opt/qbox-apps']
+    real = os.path.realpath(path)
+    if not any(real == root or real.startswith(root + '/') for root in allowed_roots):
+        raise ValueError(f'compose path not allowed: {real}')
+    return real
+
+
+def job_compose_pull(payload):
+    path = validate_compose_path(payload.get('path', '/storage/dockers'))
+    compose_file = payload.get('compose_file')
+    cmd = ['docker', 'compose']
+    if compose_file:
+        cmd += ['-f', os.path.join(path, compose_file)]
+    cmd += ['pull']
+    rc1, out1 = run_checked(cmd, timeout=900, cwd=path)
+    if rc1 != 0:
+        return 'failed', out1
+    cmd[-1] = 'up'
+    cmd += ['-d', '--remove-orphans']
+    rc2, out2 = run_checked(cmd, timeout=900, cwd=path)
+    return ('done' if rc2 == 0 else 'failed'), out1 + '\n' + out2
+
+
+def job_app_update(payload):
+    # App update is intentionally compose-based: pull exact image tags and redeploy one app bundle.
+    return job_compose_pull(payload)
+
+
+def job_app_restart(payload):
+    path = validate_compose_path(payload.get('path', '/storage/dockers'))
+    service = payload.get('service')
+    if not service:
+        raise ValueError('service is required')
+    rc, out = run_checked(['docker', 'compose', 'restart', service], timeout=300, cwd=path)
+    return ('done' if rc == 0 else 'failed'), out
+
+
+def job_agent_update(payload):
+    url = payload.get('url')
+    if not url:
+        raise ValueError('url is required')
+    sha256 = payload.get('sha256')
+    version = payload.get('version')
+    cmd = ['systemd-run', '--unit=qbox-agent-self-update', '--collect', '/opt/qbox-agent/update-agent.sh', '--url', url]
+    if sha256:
+        cmd += ['--sha256', sha256]
+    if version:
+        cmd += ['--version', version]
+    rc, out = run_checked(cmd, timeout=60)
+    return ('accepted' if rc == 0 else 'failed'), out or 'self-update scheduled through systemd-run'
+
+
+def job_shell(payload, cfg):
+    if not cfg.get('allow_shell_jobs', False):
+        return 'rejected', 'shell jobs disabled'
+    cmd = payload.get('cmd', '')
+    if not cmd:
+        return 'failed', 'cmd is required'
+    return 'done', sh(cmd, timeout=int(payload.get('timeout', 300)))
+
+
+def run_job(cfg, token, job):
+    payload = json.loads(job['payload_json']) if isinstance(job.get('payload_json'), str) else job.get('payload_json', {})
+    try:
+        acquire_lock()
+        kind = job['kind']
+        if kind == 'agent_update':
+            status, output = job_agent_update(payload)
+        elif kind == 'app_update':
+            status, output = job_app_update(payload)
+        elif kind == 'app_restart':
+            status, output = job_app_restart(payload)
+        elif kind == 'compose_pull':
+            status, output = job_compose_pull(payload)
+        elif kind == 'shell':
+            status, output = job_shell(payload, cfg)
+        else:
+            status, output = 'unknown', f'unknown job kind: {kind}'
+    except Exception as exc:
+        status, output = 'failed', str(exc)
+    finally:
+        release_lock()
+    report_job_result(cfg, token, job['id'], status, output)
+
+
+def heartbeat(cfg):
+    token = TOKEN.read_text().strip()
     payload = {
-        "serial": SERIAL,
-        "claim_token": CLAIM_TOKEN,
-        "status": "online",
-        "firmware": FIRMWARE,
-        "apps": installed_apps(),
-        "metrics": metrics(),
+        'serial': cfg['serial'],
+        'firmware': cfg.get('firmware', agent_version(cfg)),
+        'ip_address': ip_addr(),
+        'apps': installed_apps(),
+        'metrics': metrics(),
     }
-    r = requests.post(f"{CENTRAL_URL}/api/heartbeat", json=payload, timeout=10)
+    r = requests.post(cfg['central_url'].rstrip('/') + '/api/agent/heartbeat', headers={'X-Agent-Token': token}, json=payload, timeout=15)
     r.raise_for_status()
-    return r.json()
-
-
-def poll_ota():
-    r = requests.get(f"{CENTRAL_URL}/api/ota/jobs", params={"serial": SERIAL}, timeout=10)
-    r.raise_for_status()
-    for job in r.json():
-        if job.get("status") != "queued":
-            continue
-        print(f"[qbox-agent] OTA job: {job}")
-        command = job.get("command")
-        if command:
-            # For safety this test agent only logs commands unless explicitly enabled.
-            if os.getenv("QBOX_AGENT_ALLOW_COMMANDS", "false").lower() == "true":
-                subprocess.call(command, shell=True)
-            else:
-                print("[qbox-agent] command execution disabled; set QBOX_AGENT_ALLOW_COMMANDS=true")
-        requests.post(f"{CENTRAL_URL}/api/ota/jobs/{job['id']}/done", timeout=10)
+    for job in r.json().get('jobs', []):
+        run_job(cfg, token, job)
 
 
 def main():
-    print(f"[qbox-agent] starting serial={SERIAL} central={CENTRAL_URL}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--once', action='store_true')
+    parser.add_argument('--provision', action='store_true')
+    args = parser.parse_args()
+    cfg = load()
+    if args.provision or not TOKEN.exists():
+        provision(cfg)
     while True:
-        try:
-            result = provision()
-            print("[qbox-agent] provision", json.dumps(result))
-            if result.get("authorized"):
-                heartbeat()
-                poll_ota()
-            else:
-                print("[qbox-agent] waiting for authorization")
-        except Exception as exc:
-            print(f"[qbox-agent] error: {exc}")
-        time.sleep(INTERVAL)
+        heartbeat(load())
+        if args.once:
+            break
+        time.sleep(int(load().get('interval', 60)))
+
+
+if __name__ == '__main__':
+    main()

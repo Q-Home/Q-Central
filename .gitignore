@@ -1,9 +1,11 @@
 .env
-.venv/
+*.db
+*.db-*
 __pycache__/
-*.pyc
+.pytest_cache/
 node_modules/
 dist/
-central.db
-*.log
+.venv/
 .DS_Store
+backup-*.tar.gz
+agent-token

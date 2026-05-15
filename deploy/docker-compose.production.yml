@@ -1,0 +1,42 @@
+services:
+  api:
+    build: ../backend
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - qcentral-data:/data
+    networks: [qcentral]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    read_only: true
+    tmpfs: ["/tmp"]
+  frontend:
+    build: ../frontend
+    restart: unless-stopped
+    networks: [qcentral]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    read_only: true
+    tmpfs: ["/var/cache/nginx", "/var/run"]
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [qcentral]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    cap_add: ["NET_BIND_SERVICE"]
+networks:
+  qcentral:
+    driver: bridge
+volumes:
+  qcentral-data:
+  caddy-data:
+  caddy-config:
