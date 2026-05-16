@@ -8,10 +8,11 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from slowapi.middleware import SlowAPIMiddleware
 from .config import get_settings
-from .db import get_session, init_db
+from .db import get_session
 from .models import AuditLog, Device, DeviceStatus, Job, User, UserRole
 from .schemas import HeartbeatRequest, JobCreateRequest, LoginRequest, ProfileUpdateRequest, ProvisionRequest, ProvisionResponse, RegisterSerialRequest, RegisterSerialResponse, UserCreateRequest, UserUpdateRequest
 from .security import SESSION_COOKIE_NAME, authenticate_admin, create_admin_session, hash_secret, new_token, require_admin, require_agent_token, require_portal_token, verify_secret
+from .software import router as software_router
 from .zerotier import authorize_member
 
 ALLOWED_JOB_KINDS = {"agent_update", "app_update", "app_restart", "compose_pull"}
@@ -23,6 +24,7 @@ app = FastAPI(title="Q-Central API", version="1.1.0")
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(CORSMiddleware, allow_origins=settings.cors_list, allow_credentials=True, allow_methods=["GET", "POST", "PATCH"], allow_headers=["Content-Type", "Authorization", "X-Agent-Token", "X-Portal-Token"])
+app.include_router(software_router)
 
 
 @app.exception_handler(RateLimitExceeded)
@@ -32,6 +34,7 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
 
 @app.on_event("startup")
 def startup() -> None:
+    from .db import init_db
     init_db()
 
 
