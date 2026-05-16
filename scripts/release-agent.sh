@@ -60,6 +60,8 @@ API="https://api.github.com/repos/${GITHUB_REPO}"
 DIST_DIR="$ROOT_DIR/dist"
 ARCHIVE="$DIST_DIR/qbox-agent-${VERSION}.tar.gz"
 MANIFEST="$DIST_DIR/qbox-agent-${VERSION}.manifest.json"
+TMP_DIR="$(mktemp -d /tmp/qcentral-release.XXXXXX)"
+trap 'rm -rf "$TMP_DIR"' EXIT
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || { echo "Missing command: $1" >&2; exit 1; }
@@ -73,25 +75,75 @@ json_escape() {
   python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'
 }
 
-api_call() {
+json_get() {
+  local file="$1"
+  local expr="$2"
+  python3 - "$file" "$expr" <<'PY'
+import json, sys
+path, expr = sys.argv[1], sys.argv[2]
+with open(path, 'r', encoding='utf-8') as f:
+    data = json.load(f)
+value = data
+for part in expr.split('.'):
+    if not part:
+        continue
+    value = value[part]
+print(value)
+PY
+}
+
+json_find_asset_id() {
+  local file="$1"
+  local name="$2"
+  python3 - "$file" "$name" <<'PY'
+import json, sys
+path, wanted = sys.argv[1], sys.argv[2]
+with open(path, 'r', encoding='utf-8') as f:
+    assets = json.load(f)
+for asset in assets:
+    if asset.get('name') == wanted:
+        print(asset.get('id'))
+        break
+PY
+}
+
+api_call_file() {
   local method="$1"
   local url="$2"
-  local data="${3:-}"
-  if [[ -n "$data" ]]; then
-    curl -fsSL -X "$method" \
+  local output="$3"
+  local data_file="${4:-}"
+  local status_file="${output}.status"
+  local http_code
+  if [[ -n "$data_file" ]]; then
+    http_code="$(curl -sS -X "$method" \
       -H "Authorization: Bearer ${GITHUB_TOKEN}" \
       -H "Accept: application/vnd.github+json" \
       -H "X-GitHub-Api-Version: 2022-11-28" \
       -H "Content-Type: application/json" \
-      --data "$data" \
-      "$url"
+      --data-binary "@$data_file" \
+      -o "$output" -w '%{http_code}' \
+      "$url")"
   else
-    curl -fsSL -X "$method" \
+    http_code="$(curl -sS -X "$method" \
       -H "Authorization: Bearer ${GITHUB_TOKEN}" \
       -H "Accept: application/vnd.github+json" \
       -H "X-GitHub-Api-Version: 2022-11-28" \
-      "$url"
+      -o "$output" -w '%{http_code}' \
+      "$url")"
   fi
+  printf '%s' "$http_code" > "$status_file"
+  if [[ "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
+    return 1
+  fi
+}
+
+api_delete() {
+  local url="$1"
+  curl -fsSL -X DELETE \
+    -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "$url" >/dev/null
 }
 
 upload_asset() {
@@ -100,22 +152,14 @@ upload_asset() {
   local name
   name="$(basename "$file")"
   local upload_url="https://uploads.github.com/repos/${GITHUB_REPO}/releases/${release_id}/assets?name=${name}"
+  local assets_file="$TMP_DIR/assets.json"
 
   echo "[Q-Central] Removing existing asset if present: $name"
-  local assets existing_id
-  assets="$(api_call GET "${API}/releases/${release_id}/assets")"
-  existing_id="$(python3 - <<PY
-import json
-assets=json.loads('''$assets''')
-name='$name'
-for a in assets:
-    if a.get('name') == name:
-        print(a.get('id'))
-        break
-PY
-)"
+  api_call_file GET "${API}/releases/${release_id}/assets" "$assets_file"
+  local existing_id
+  existing_id="$(json_find_asset_id "$assets_file" "$name")"
   if [[ -n "$existing_id" ]]; then
-    api_call DELETE "${API}/releases/assets/${existing_id}" >/dev/null
+    api_delete "${API}/releases/assets/${existing_id}"
   fi
 
   echo "[Q-Central] Uploading asset: $name"
@@ -157,7 +201,8 @@ This release is discoverable by Q-Central Software Repository."
 fi
 
 NOTES_JSON="$(printf '%s' "$NOTES" | json_escape)"
-RELEASE_PAYLOAD="$(cat <<JSON
+PAYLOAD_FILE="$TMP_DIR/release-payload.json"
+cat > "$PAYLOAD_FILE" <<JSON
 {
   "tag_name": "$TAG",
   "name": "$RELEASE_NAME",
@@ -166,26 +211,22 @@ RELEASE_PAYLOAD="$(cat <<JSON
   "prerelease": $PRERELEASE
 }
 JSON
-)"
 
 RELEASE_ID=""
+RELEASE_FILE="$TMP_DIR/release.json"
 echo "[Q-Central] Checking GitHub release $TAG"
-if release_json="$(api_call GET "${API}/releases/tags/${TAG}" 2>/dev/null)"; then
-  RELEASE_ID="$(python3 - <<PY
-import json
-print(json.loads('''$release_json''')['id'])
-PY
-)"
+if api_call_file GET "${API}/releases/tags/${TAG}" "$RELEASE_FILE"; then
+  RELEASE_ID="$(json_get "$RELEASE_FILE" id)"
   echo "[Q-Central] Updating existing release id $RELEASE_ID"
-  api_call PATCH "${API}/releases/${RELEASE_ID}" "$RELEASE_PAYLOAD" >/dev/null
+  api_call_file PATCH "${API}/releases/${RELEASE_ID}" "$RELEASE_FILE" "$PAYLOAD_FILE"
 else
   echo "[Q-Central] Creating release $TAG"
-  release_json="$(api_call POST "${API}/releases" "$RELEASE_PAYLOAD")"
-  RELEASE_ID="$(python3 - <<PY
-import json
-print(json.loads('''$release_json''')['id'])
-PY
-)"
+  if ! api_call_file POST "${API}/releases" "$RELEASE_FILE" "$PAYLOAD_FILE"; then
+    echo "GitHub release creation failed:" >&2
+    cat "$RELEASE_FILE" >&2
+    exit 1
+  fi
+  RELEASE_ID="$(json_get "$RELEASE_FILE" id)"
 fi
 
 upload_asset "$RELEASE_ID" "$ARCHIVE"
