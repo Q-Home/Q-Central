@@ -11,6 +11,7 @@ from .models import Device, Job
 from .security import require_admin
 
 router = APIRouter(prefix="/api/software", tags=["Software Repository"])
+stripped_router = APIRouter(prefix="/software", tags=["Software Repository"])
 
 AGENT_ASSET_PREFIX = "qbox-agent-"
 OTA_STATUSES = ["queued", "downloading", "installing", "rebooting", "success", "failed"]
@@ -127,8 +128,7 @@ def software_jobs_snapshot(session: Session, serial: str | None = None) -> dict:
     return {"jobs": rows, "counters": {status: counters.get(status, 0) for status in OTA_STATUSES}, "success": counters.get("success", 0), "failed": counters.get("failed", 0), "rollouts": sorted(rollouts, key=lambda r: r["latest_at"], reverse=True), "generated_at": datetime.now(timezone.utc).isoformat()}
 
 
-@router.get("/agent/releases")
-def agent_releases(actor: str = Depends(require_admin)):
+def _agent_releases():
     try:
         releases = fetch_json(f"https://api.github.com/repos/{github_repo()}/releases")
     except Exception as exc:
@@ -141,8 +141,7 @@ def agent_releases(actor: str = Depends(require_admin)):
     return {"repository": github_repo(), "releases": items, "count": len(items), "generated_at": datetime.now(timezone.utc).isoformat()}
 
 
-@router.post("/agent/queue")
-def queue_agent_release(body: dict, session: Session = Depends(get_session), actor: str = Depends(require_admin)):
+def _queue_agent_release(body: dict, session: Session):
     serials = body.get("serials") or []
     version = body.get("version")
     url = body.get("url")
@@ -170,13 +169,31 @@ def queue_agent_release(body: dict, session: Session = Depends(get_session), act
     return {"ok": True, "rollout_id": rollout_id, "jobs": [job_row(j) for j in jobs]}
 
 
-@router.post("/agent/rollback")
-def rollback_agent_release(body: dict, session: Session = Depends(get_session), actor: str = Depends(require_admin)):
+def _rollback_agent_release(body: dict, session: Session):
     body["rollback"] = True
     body["rollback_from"] = body.get("rollback_from") or body.get("current_version")
-    return queue_agent_release(body, session, actor)
+    return _queue_agent_release(body, session)
+
+
+@router.get("/agent/releases")
+@stripped_router.get("/agent/releases")
+def agent_releases(actor: str = Depends(require_admin)):
+    return _agent_releases()
+
+
+@router.post("/agent/queue")
+@stripped_router.post("/agent/queue")
+def queue_agent_release(body: dict, session: Session = Depends(get_session), actor: str = Depends(require_admin)):
+    return _queue_agent_release(body, session)
+
+
+@router.post("/agent/rollback")
+@stripped_router.post("/agent/rollback")
+def rollback_agent_release(body: dict, session: Session = Depends(get_session), actor: str = Depends(require_admin)):
+    return _rollback_agent_release(body, session)
 
 
 @router.get("/jobs")
+@stripped_router.get("/jobs")
 def software_jobs(serial: str | None = None, session: Session = Depends(get_session), actor: str = Depends(require_admin)):
     return software_jobs_snapshot(session, serial)
