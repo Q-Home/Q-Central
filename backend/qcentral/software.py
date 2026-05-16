@@ -5,20 +5,28 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
+from .config import get_settings
 from .db import get_session
 from .models import Device, Job
 from .security import require_admin
 
 router = APIRouter(prefix="/api/software", tags=["Software Repository"])
 
-GITHUB_REPO = "Q-Home/Q-Central"
 AGENT_ASSET_PREFIX = "qbox-agent-"
 OTA_STATUSES = ["queued", "downloading", "installing", "rebooting", "success", "failed"]
 STATUS_PROGRESS = {"queued": 0, "downloading": 25, "installing": 60, "rebooting": 85, "accepted": 85, "done": 100, "success": 100, "failed": 100}
 
 
+def github_repo() -> str:
+    return get_settings().software_github_repo
+
+
 def fetch_json(url: str):
-    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "Q-Central"})
+    settings = get_settings()
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "Q-Central"}
+    if settings.github_token:
+        headers["Authorization"] = f"Bearer {settings.github_token}"
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=20) as response:
         return json.loads(response.read().decode("utf-8"))
 
@@ -122,7 +130,7 @@ def software_jobs_snapshot(session: Session, serial: str | None = None) -> dict:
 @router.get("/agent/releases")
 def agent_releases(actor: str = Depends(require_admin)):
     try:
-        releases = fetch_json(f"https://api.github.com/repos/{GITHUB_REPO}/releases")
+        releases = fetch_json(f"https://api.github.com/repos/{github_repo()}/releases")
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"could not fetch GitHub releases: {exc}")
     items = []
@@ -130,7 +138,7 @@ def agent_releases(actor: str = Depends(require_admin)):
         item = normalize_agent_release(release)
         if item:
             items.append(item)
-    return {"repository": GITHUB_REPO, "releases": items, "count": len(items), "generated_at": datetime.now(timezone.utc).isoformat()}
+    return {"repository": github_repo(), "releases": items, "count": len(items), "generated_at": datetime.now(timezone.utc).isoformat()}
 
 
 @router.post("/agent/queue")
