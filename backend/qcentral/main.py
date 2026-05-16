@@ -21,7 +21,7 @@ ADMIN_ROLES = {"superadmin", "admin"}
 
 settings = get_settings()
 limiter = Limiter(key_func=get_remote_address, default_limits=["240/minute"])
-app = FastAPI(title="Q-Central API", version="1.2.1")
+app = FastAPI(title="Q-Central API", version="1.2.2")
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(CORSMiddleware, allow_origins=settings.cors_list, allow_credentials=True, allow_methods=["GET", "POST", "PATCH"], allow_headers=["Content-Type", "Authorization", "X-Agent-Token", "X-Portal-Token"])
@@ -66,17 +66,7 @@ def as_utc_naive(value):
 
 
 def user_payload(user: User) -> dict:
-    return {
-        "username": user.username,
-        "role": user.role.value if hasattr(user.role, "value") else str(user.role),
-        "full_name": user.full_name,
-        "email": user.email,
-        "is_active": user.is_active,
-        "mfa_enabled": user.mfa_enabled,
-        "created_at": user.created_at.isoformat() if user.created_at else None,
-        "updated_at": user.updated_at.isoformat() if user.updated_at else None,
-        "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
-    }
+    return {"username": user.username, "role": user.role.value if hasattr(user.role, "value") else str(user.role), "full_name": user.full_name, "email": user.email, "is_active": user.is_active, "mfa_enabled": user.mfa_enabled, "created_at": user.created_at.isoformat() if user.created_at else None, "updated_at": user.updated_at.isoformat() if user.updated_at else None, "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None}
 
 
 def get_or_bootstrap_user(session: Session, username: str) -> User | None:
@@ -127,34 +117,14 @@ def normalized_device_status(device: Device) -> str:
 def device_payload(device: Device, session: Session) -> dict:
     metrics, apps = latest_device_heartbeat(session, device.serial)
     last_seen = as_utc_naive(device.last_seen)
-    return {
-        "serial": device.serial,
-        "name": device.name,
-        "customer": device.customer,
-        "site": device.site,
-        "model": device.model,
-        "status": normalized_device_status(device),
-        "authorized": device.authorized,
-        "firmware": device.firmware,
-        "target_firmware": device.target_firmware,
-        "agent_version": metrics.get("agent_version"),
-        "hostname": metrics.get("hostname"),
-        "ip_address": device.ip_address,
-        "zerotier_node_id": device.zerotier_node_id,
-        "zerotier_network_id": device.zerotier_network_id,
-        "last_seen": last_seen.isoformat() if last_seen else None,
-        "apps": apps,
-        "metrics": metrics,
-        "cpu_percent": metrics.get("cpu_percent"),
-        "mem_percent": metrics.get("mem_percent"),
-        "disk_percent": metrics.get("disk_percent"),
-    }
+    return {"serial": device.serial, "name": device.name, "customer": device.customer, "site": device.site, "model": device.model, "status": normalized_device_status(device), "authorized": device.authorized, "firmware": device.firmware, "target_firmware": device.target_firmware, "agent_version": metrics.get("agent_version"), "hostname": metrics.get("hostname"), "ip_address": device.ip_address, "zerotier_node_id": device.zerotier_node_id, "zerotier_network_id": device.zerotier_network_id, "last_seen": last_seen.isoformat() if last_seen else None, "apps": apps, "metrics": metrics, "cpu_percent": metrics.get("cpu_percent"), "mem_percent": metrics.get("mem_percent"), "disk_percent": metrics.get("disk_percent")}
 
 
 portal_device_payload = device_payload
 
 
 @app.websocket("/api/software/ws")
+@app.websocket("/software/ws")
 async def software_ws(websocket: WebSocket):
     await websocket.accept()
     try:
@@ -173,6 +143,7 @@ def healthz():
 
 
 @app.post("/api/auth/login", tags=["Auth"])
+@app.post("/auth/login", tags=["Auth"])
 @limiter.limit("5/minute")
 def login(request: Request, response: Response, body: LoginRequest, session: Session = Depends(get_session)):
     ip = client_ip(request)
@@ -203,6 +174,7 @@ def login(request: Request, response: Response, body: LoginRequest, session: Ses
 
 
 @app.post("/api/auth/logout", tags=["Auth"])
+@app.post("/auth/logout", tags=["Auth"])
 def logout(response: Response, actor: str = Depends(require_admin), session: Session = Depends(get_session)):
     response.delete_cookie(SESSION_COOKIE_NAME, path="/")
     audit(session, "admin_logout", actor)
@@ -211,16 +183,19 @@ def logout(response: Response, actor: str = Depends(require_admin), session: Ses
 
 
 @app.get("/api/auth/me", tags=["Auth"])
+@app.get("/auth/me", tags=["Auth"])
 def me(actor: str = Depends(require_admin), session: Session = Depends(get_session)):
     return user_payload(current_user(session, actor))
 
 
 @app.get("/api/profile", tags=["Profile"])
+@app.get("/profile", tags=["Profile"])
 def profile(actor: str = Depends(require_admin), session: Session = Depends(get_session)):
     return user_payload(current_user(session, actor))
 
 
 @app.post("/api/profile/change-password", tags=["Profile"])
+@app.post("/profile/change-password", tags=["Profile"])
 def change_profile_password(body: ProfileUpdateRequest, actor: str = Depends(require_admin), session: Session = Depends(get_session)):
     user = current_user(session, actor)
     if not verify_secret(body.current_value, user.credential_hash):
@@ -236,6 +211,7 @@ def change_profile_password(body: ProfileUpdateRequest, actor: str = Depends(req
 
 
 @app.get("/api/users", tags=["RBAC"])
+@app.get("/users", tags=["RBAC"])
 def list_users(actor: str = Depends(require_admin), session: Session = Depends(get_session)):
     require_admin_role(session, actor)
     users = session.exec(select(User).order_by(User.username)).all()
@@ -243,6 +219,7 @@ def list_users(actor: str = Depends(require_admin), session: Session = Depends(g
 
 
 @app.post("/api/users", tags=["RBAC"])
+@app.post("/users", tags=["RBAC"])
 def create_user(body: UserCreateRequest, actor: str = Depends(require_admin), session: Session = Depends(get_session)):
     require_admin_role(session, actor)
     if session.get(User, body.username):
@@ -260,6 +237,7 @@ def create_user(body: UserCreateRequest, actor: str = Depends(require_admin), se
 
 
 @app.patch("/api/users/{username}", tags=["RBAC"])
+@app.patch("/users/{username}", tags=["RBAC"])
 def update_user(username: str, body: UserUpdateRequest, actor: str = Depends(require_admin), session: Session = Depends(get_session)):
     require_admin_role(session, actor)
     user = session.get(User, username)
@@ -290,12 +268,14 @@ def update_user(username: str, body: UserUpdateRequest, actor: str = Depends(req
 
 
 @app.get("/api/devices", tags=["Devices"])
+@app.get("/devices", tags=["Devices"])
 def list_devices(session: Session = Depends(get_session), actor: str = Depends(require_admin)):
     devices = session.exec(select(Device).order_by(Device.updated_at.desc())).all()
     return [device_payload(device, session) for device in devices]
 
 
 @app.get("/api/monitoring/overview", tags=["Monitoring"])
+@app.get("/monitoring/overview", tags=["Monitoring"])
 def monitoring_overview(session: Session = Depends(get_session), actor: str = Depends(require_admin)):
     devices = session.exec(select(Device).order_by(Device.updated_at.desc())).all()
     rows = [device_payload(device, session) for device in devices]
@@ -319,6 +299,7 @@ def monitoring_overview(session: Session = Depends(get_session), actor: str = De
 
 
 @app.post("/api/serials", response_model=RegisterSerialResponse, tags=["Devices"])
+@app.post("/serials", response_model=RegisterSerialResponse, tags=["Devices"])
 @limiter.limit("30/minute")
 def register_serial(request: Request, body: RegisterSerialRequest, session: Session = Depends(get_session), actor: str = Depends(require_admin)):
     existing = session.get(Device, body.serial)
@@ -333,6 +314,7 @@ def register_serial(request: Request, body: RegisterSerialRequest, session: Sess
 
 
 @app.post("/api/provision", response_model=ProvisionResponse, tags=["Agent"])
+@app.post("/provision", response_model=ProvisionResponse, tags=["Agent"])
 @limiter.limit("20/minute")
 async def provision(request: Request, body: ProvisionRequest, session: Session = Depends(get_session)):
     device = session.get(Device, body.serial)
@@ -363,6 +345,7 @@ async def provision(request: Request, body: ProvisionRequest, session: Session =
 
 
 @app.post("/api/agent/heartbeat", tags=["Agent"])
+@app.post("/agent/heartbeat", tags=["Agent"])
 @limiter.limit("120/minute")
 def heartbeat(request: Request, body: HeartbeatRequest, session: Session = Depends(get_session), token: str = Depends(require_agent_token)):
     device = session.get(Device, body.serial)
@@ -381,6 +364,7 @@ def heartbeat(request: Request, body: HeartbeatRequest, session: Session = Depen
 
 
 @app.post("/api/jobs", tags=["Jobs"])
+@app.post("/jobs", tags=["Jobs"])
 def create_job(body: JobCreateRequest, session: Session = Depends(get_session), actor: str = Depends(require_admin)):
     if body.kind not in ALLOWED_JOB_KINDS:
         raise HTTPException(status_code=400, detail=f"unsupported job kind: {body.kind}")
@@ -397,6 +381,7 @@ def create_job(body: JobCreateRequest, session: Session = Depends(get_session), 
 
 
 @app.post("/api/jobs/agent-update", tags=["Jobs"])
+@app.post("/jobs/agent-update", tags=["Jobs"])
 def create_agent_update_job(body: dict, session: Session = Depends(get_session), actor: str = Depends(require_admin)):
     required = {"serial", "url", "sha256"}
     missing = required - set(body)
@@ -415,6 +400,7 @@ def create_agent_update_job(body: dict, session: Session = Depends(get_session),
 
 
 @app.post("/api/jobs/{job_id}/result", tags=["Jobs"])
+@app.post("/jobs/{job_id}/result", tags=["Jobs"])
 def job_result(job_id: int, result: dict, session: Session = Depends(get_session), token: str = Depends(require_agent_token)):
     job = session.get(Job, job_id)
     if not job:
@@ -432,6 +418,7 @@ def job_result(job_id: int, result: dict, session: Session = Depends(get_session
 
 
 @app.get("/api/portal/device/{serial}", tags=["Portal API"])
+@app.get("/portal/device/{serial}", tags=["Portal API"])
 def portal_device(serial: str, session: Session = Depends(get_session), actor: str = Depends(require_portal_token)):
     device = session.get(Device, serial)
     if not device:
@@ -440,6 +427,7 @@ def portal_device(serial: str, session: Session = Depends(get_session), actor: s
 
 
 @app.get("/api/portal/devices", tags=["Portal API"])
+@app.get("/portal/devices", tags=["Portal API"])
 def portal_devices(customer: str | None = None, site: str | None = None, session: Session = Depends(get_session), actor: str = Depends(require_portal_token)):
     stmt = select(Device).order_by(Device.updated_at.desc())
     if customer:
