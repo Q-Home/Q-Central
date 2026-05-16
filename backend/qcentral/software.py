@@ -13,8 +13,8 @@ router = APIRouter(prefix="/api/software", tags=["Software Repository"])
 
 GITHUB_REPO = "Q-Home/Q-Central"
 AGENT_ASSET_PREFIX = "qbox-agent-"
-OTA_STATUSES = ["queued", "downloading", "installing", "rebooting", "accepted", "success", "failed"]
-DONE_STATUSES = {"done", "success"}
+OTA_STATUSES = ["queued", "downloading", "installing", "rebooting", "success", "failed"]
+STATUS_PROGRESS = {"queued": 0, "downloading": 25, "installing": 60, "rebooting": 85, "accepted": 85, "done": 100, "success": 100, "failed": 100}
 
 
 def fetch_json(url: str):
@@ -73,11 +73,22 @@ def normalize_agent_release(release: dict) -> dict | None:
     }
 
 
-def job_payload(job: Job) -> dict:
-    try:
-        return json.loads(job.payload_json or "{}")
-    except Exception:
+def safe_json(value: str | None) -> dict:
+    if not value:
         return {}
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {"output": value}
+    except Exception:
+        return {"output": value}
+
+
+def job_payload(job: Job) -> dict:
+    return safe_json(job.payload_json)
+
+
+def job_result(job: Job) -> dict:
+    return safe_json(job.result)
 
 
 def normalized_job_status(job: Job) -> str:
@@ -88,19 +99,33 @@ def normalized_job_status(job: Job) -> str:
     return job.status
 
 
+def job_progress(job: Job) -> int:
+    result = job_result(job)
+    if isinstance(result.get("progress"), int):
+        return max(0, min(100, result["progress"]))
+    return STATUS_PROGRESS.get(normalized_job_status(job), 0)
+
+
 def job_row(job: Job) -> dict:
     payload = job_payload(job)
+    result = job_result(job)
     return {
         "id": job.id,
         "serial": job.serial,
         "kind": job.kind,
         "status": normalized_job_status(job),
         "raw_status": job.status,
+        "progress_percent": job_progress(job),
+        "stage": result.get("stage") or normalized_job_status(job),
         "payload": payload,
         "version": payload.get("version"),
         "batch": payload.get("batch"),
+        "batch_size": payload.get("batch_size"),
+        "rollout_id": payload.get("rollout_id"),
         "rollback": payload.get("rollback", False),
-        "result": job.result,
+        "rollback_from": payload.get("rollback_from"),
+        "result": result,
+        "result_text": result.get("output") or job.result,
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
     }
@@ -139,17 +164,7 @@ def queue_agent_release(body: dict, session: Session = Depends(get_session), act
         if not session.get(Device, serial):
             raise HTTPException(status_code=404, detail=f"device not found: {serial}")
         batch = index // max(1, batch_size) + 1
-        payload = {
-            "url": url,
-            "sha256": sha256,
-            "version": version,
-            "source": "software_repository",
-            "rollout_id": rollout_id,
-            "batch": batch,
-            "batch_size": batch_size,
-            "rollback": rollback,
-            "rollback_from": rollback_from,
-        }
+        payload = {"url": url, "sha256": sha256, "version": version, "source": "software_repository", "rollout_id": rollout_id, "batch": batch, "batch_size": batch_size, "rollback": rollback, "rollback_from": rollback_from}
         job = Job(serial=serial, kind="agent_update", payload_json=json.dumps(payload), status="queued")
         session.add(job)
         jobs.append(job)
@@ -157,6 +172,13 @@ def queue_agent_release(body: dict, session: Session = Depends(get_session), act
     for job in jobs:
         session.refresh(job)
     return {"ok": True, "rollout_id": rollout_id, "jobs": [job_row(j) for j in jobs]}
+
+
+@router.post("/agent/rollback")
+def rollback_agent_release(body: dict, session: Session = Depends(get_session), actor: str = Depends(require_admin)):
+    body["rollback"] = True
+    body["rollback_from"] = body.get("rollback_from") or body.get("current_version")
+    return queue_agent_release(body, session, actor)
 
 
 @router.get("/jobs")
@@ -169,7 +191,7 @@ def software_jobs(serial: str | None = None, session: Session = Depends(get_sess
     counters = Counter(row["status"] for row in rows)
     by_rollout = {}
     for row in rows:
-        rollout_id = row["payload"].get("rollout_id") or "manual"
+        rollout_id = row.get("rollout_id") or "manual"
         group = by_rollout.setdefault(rollout_id, {"rollout_id": rollout_id, "jobs": [], "counters": Counter()})
         group["jobs"].append(row)
         group["counters"][row["status"]] += 1
@@ -177,15 +199,7 @@ def software_jobs(serial: str | None = None, session: Session = Depends(get_sess
     for group in by_rollout.values():
         counters_dict = {status: group["counters"].get(status, 0) for status in OTA_STATUSES}
         total = len(group["jobs"])
-        finished = counters_dict.get("success", 0) + counters_dict.get("failed", 0)
-        progress = round((finished / total) * 100) if total else 0
+        progress = round(sum(job.get("progress_percent", 0) for job in group["jobs"]) / total) if total else 0
         latest = max((job.get("updated_at") or job.get("created_at") or "") for job in group["jobs"])
         rollouts.append({"rollout_id": group["rollout_id"], "total": total, "progress_percent": progress, "counters": counters_dict, "latest_at": latest})
-    return {
-        "jobs": rows,
-        "counters": {status: counters.get(status, 0) for status in OTA_STATUSES},
-        "success": counters.get("success", 0),
-        "failed": counters.get("failed", 0),
-        "rollouts": sorted(rollouts, key=lambda r: r["latest_at"], reverse=True),
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-    }
+    return {"jobs": rows, "counters": {status: counters.get(status, 0) for status in OTA_STATUSES}, "success": counters.get("success", 0), "failed": counters.get("failed", 0), "rollouts": sorted(rollouts, key=lambda r: r["latest_at"], reverse=True), "generated_at": datetime.now(timezone.utc).isoformat()}
