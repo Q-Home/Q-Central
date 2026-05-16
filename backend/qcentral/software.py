@@ -14,6 +14,7 @@ router = APIRouter(prefix="/api/software", tags=["Software Repository"])
 stripped_router = APIRouter(prefix="/software", tags=["Software Repository"])
 
 AGENT_ASSET_PREFIX = "qbox-agent-"
+MAX_RELEASES = 30
 OTA_STATUSES = ["queued", "downloading", "installing", "rebooting", "success", "failed"]
 STATUS_PROGRESS = {"queued": 0, "downloading": 25, "installing": 60, "rebooting": 85, "accepted": 85, "done": 100, "success": 100, "failed": 100}
 
@@ -45,6 +46,18 @@ def normalize_version(value: str | None) -> str | None:
     if not value:
         return value
     return str(value).replace("qbox-agent-", "").lstrip("v")
+
+
+def release_sort_key(item: dict) -> tuple:
+    published = item.get("published_at") or ""
+    version = item.get("version") or ""
+    parts = []
+    for part in str(version).replace("-", ".").split("."):
+        try:
+            parts.append(int(part))
+        except ValueError:
+            parts.append(0)
+    return (published, parts)
 
 
 def normalize_agent_release(release: dict) -> dict | None:
@@ -138,7 +151,11 @@ def _agent_releases():
         item = normalize_agent_release(release)
         if item:
             items.append(item)
-    return {"repository": github_repo(), "releases": items, "count": len(items), "generated_at": datetime.now(timezone.utc).isoformat()}
+    items = sorted(items, key=release_sort_key, reverse=True)[:MAX_RELEASES]
+    for index, item in enumerate(items):
+        item["latest"] = index == 0
+        item["channel"] = "beta" if item.get("prerelease") else "stable"
+    return {"repository": github_repo(), "releases": items, "latest": items[0] if items else None, "count": len(items), "generated_at": datetime.now(timezone.utc).isoformat()}
 
 
 def _queue_agent_release(body: dict, session: Session):
