@@ -54,23 +54,7 @@ def normalize_agent_release(release: dict) -> dict | None:
     manifest_data = fetch_release_manifest(manifest_url)
     fallback_version = archive.get("name", "").replace(AGENT_ASSET_PREFIX, "").replace(".tar.gz", "")
     version = manifest_data.get("version") or normalize_version(release.get("tag_name") or release.get("name") or fallback_version)
-    return {
-        "kind": "agent_update",
-        "name": release.get("name") or version,
-        "version": normalize_version(version),
-        "tag": release.get("tag_name"),
-        "draft": release.get("draft", False),
-        "prerelease": release.get("prerelease", False),
-        "published_at": release.get("published_at"),
-        "url": archive.get("browser_download_url"),
-        "asset_name": archive.get("name"),
-        "size_bytes": archive.get("size") or manifest_data.get("size_bytes"),
-        "manifest_url": manifest_url,
-        "manifest": manifest_data,
-        "html_url": release.get("html_url"),
-        "sha256": manifest_data.get("sha256"),
-        "ready": bool(archive.get("browser_download_url") and manifest_data.get("sha256")),
-    }
+    return {"kind": "agent_update", "name": release.get("name") or version, "version": normalize_version(version), "tag": release.get("tag_name"), "draft": release.get("draft", False), "prerelease": release.get("prerelease", False), "published_at": release.get("published_at"), "url": archive.get("browser_download_url"), "asset_name": archive.get("name"), "size_bytes": archive.get("size") or manifest_data.get("size_bytes"), "manifest_url": manifest_url, "manifest": manifest_data, "html_url": release.get("html_url"), "sha256": manifest_data.get("sha256"), "ready": bool(archive.get("browser_download_url") and manifest_data.get("sha256"))}
 
 
 def safe_json(value: str | None) -> dict:
@@ -109,26 +93,30 @@ def job_progress(job: Job) -> int:
 def job_row(job: Job) -> dict:
     payload = job_payload(job)
     result = job_result(job)
-    return {
-        "id": job.id,
-        "serial": job.serial,
-        "kind": job.kind,
-        "status": normalized_job_status(job),
-        "raw_status": job.status,
-        "progress_percent": job_progress(job),
-        "stage": result.get("stage") or normalized_job_status(job),
-        "payload": payload,
-        "version": payload.get("version"),
-        "batch": payload.get("batch"),
-        "batch_size": payload.get("batch_size"),
-        "rollout_id": payload.get("rollout_id"),
-        "rollback": payload.get("rollback", False),
-        "rollback_from": payload.get("rollback_from"),
-        "result": result,
-        "result_text": result.get("output") or job.result,
-        "created_at": job.created_at.isoformat() if job.created_at else None,
-        "updated_at": job.updated_at.isoformat() if job.updated_at else None,
-    }
+    return {"id": job.id, "serial": job.serial, "kind": job.kind, "status": normalized_job_status(job), "raw_status": job.status, "progress_percent": job_progress(job), "stage": result.get("stage") or normalized_job_status(job), "payload": payload, "version": payload.get("version"), "batch": payload.get("batch"), "batch_size": payload.get("batch_size"), "rollout_id": payload.get("rollout_id"), "rollback": payload.get("rollback", False), "rollback_from": payload.get("rollback_from"), "result": result, "result_text": result.get("output") or job.result, "created_at": job.created_at.isoformat() if job.created_at else None, "updated_at": job.updated_at.isoformat() if job.updated_at else None}
+
+
+def software_jobs_snapshot(session: Session, serial: str | None = None) -> dict:
+    stmt = select(Job).order_by(Job.created_at.desc()).limit(250)
+    if serial:
+        stmt = select(Job).where(Job.serial == serial).order_by(Job.created_at.desc()).limit(250)
+    jobs = session.exec(stmt).all()
+    rows = [job_row(job) for job in jobs]
+    counters = Counter(row["status"] for row in rows)
+    by_rollout = {}
+    for row in rows:
+        rollout_id = row.get("rollout_id") or "manual"
+        group = by_rollout.setdefault(rollout_id, {"rollout_id": rollout_id, "jobs": [], "counters": Counter()})
+        group["jobs"].append(row)
+        group["counters"][row["status"]] += 1
+    rollouts = []
+    for group in by_rollout.values():
+        counters_dict = {status: group["counters"].get(status, 0) for status in OTA_STATUSES}
+        total = len(group["jobs"])
+        progress = round(sum(job.get("progress_percent", 0) for job in group["jobs"]) / total) if total else 0
+        latest = max((job.get("updated_at") or job.get("created_at") or "") for job in group["jobs"])
+        rollouts.append({"rollout_id": group["rollout_id"], "total": total, "progress_percent": progress, "counters": counters_dict, "latest_at": latest})
+    return {"jobs": rows, "counters": {status: counters.get(status, 0) for status in OTA_STATUSES}, "success": counters.get("success", 0), "failed": counters.get("failed", 0), "rollouts": sorted(rollouts, key=lambda r: r["latest_at"], reverse=True), "generated_at": datetime.now(timezone.utc).isoformat()}
 
 
 @router.get("/agent/releases")
@@ -164,7 +152,7 @@ def queue_agent_release(body: dict, session: Session = Depends(get_session), act
         if not session.get(Device, serial):
             raise HTTPException(status_code=404, detail=f"device not found: {serial}")
         batch = index // max(1, batch_size) + 1
-        payload = {"url": url, "sha256": sha256, "version": version, "source": "software_repository", "rollout_id": rollout_id, "batch": batch, "batch_size": batch_size, "rollback": rollback, "rollback_from": rollback_from}
+        payload = {"url": url, "sha256": sha256, "version": version, "source": "software_repository", "rollout_id": rollout_id, "batch": batch, "batch_size": batch_size, "rollback": rollback, "rollback_from": rollback_from, "canary": body.get("canary", False), "maintenance_window": body.get("maintenance_window"), "auto_rollback": body.get("auto_rollback", False)}
         job = Job(serial=serial, kind="agent_update", payload_json=json.dumps(payload), status="queued")
         session.add(job)
         jobs.append(job)
@@ -183,23 +171,4 @@ def rollback_agent_release(body: dict, session: Session = Depends(get_session), 
 
 @router.get("/jobs")
 def software_jobs(serial: str | None = None, session: Session = Depends(get_session), actor: str = Depends(require_admin)):
-    stmt = select(Job).order_by(Job.created_at.desc()).limit(250)
-    if serial:
-        stmt = select(Job).where(Job.serial == serial).order_by(Job.created_at.desc()).limit(250)
-    jobs = session.exec(stmt).all()
-    rows = [job_row(job) for job in jobs]
-    counters = Counter(row["status"] for row in rows)
-    by_rollout = {}
-    for row in rows:
-        rollout_id = row.get("rollout_id") or "manual"
-        group = by_rollout.setdefault(rollout_id, {"rollout_id": rollout_id, "jobs": [], "counters": Counter()})
-        group["jobs"].append(row)
-        group["counters"][row["status"]] += 1
-    rollouts = []
-    for group in by_rollout.values():
-        counters_dict = {status: group["counters"].get(status, 0) for status in OTA_STATUSES}
-        total = len(group["jobs"])
-        progress = round(sum(job.get("progress_percent", 0) for job in group["jobs"]) / total) if total else 0
-        latest = max((job.get("updated_at") or job.get("created_at") or "") for job in group["jobs"])
-        rollouts.append({"rollout_id": group["rollout_id"], "total": total, "progress_percent": progress, "counters": counters_dict, "latest_at": latest})
-    return {"jobs": rows, "counters": {status: counters.get(status, 0) for status in OTA_STATUSES}, "success": counters.get("success", 0), "failed": counters.get("failed", 0), "rollouts": sorted(rollouts, key=lambda r: r["latest_at"], reverse=True), "generated_at": datetime.now(timezone.utc).isoformat()}
+    return software_jobs_snapshot(session, serial)
