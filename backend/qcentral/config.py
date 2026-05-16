@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     cors_origins: str = "https://q-central.zt.q-home.local"
     zerotier_network_id: str | None = None
     zerotier_api_token: str | None = None
+    github_token: str | None = None
+    software_github_repo: str = "Q-Home/Q-Central"
     auto_authorize: bool = True
     log_level: str = "INFO"
     metrics_enabled: bool = True
