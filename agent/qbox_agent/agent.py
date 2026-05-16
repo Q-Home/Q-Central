@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import platform
 import socket
 import subprocess
 import time
@@ -13,6 +14,7 @@ CONFIG = Path('/etc/qbox-agent/config.json')
 TOKEN = Path('/etc/qbox-agent/agent-token')
 VERSION_FILE = Path('/etc/qbox-agent/version')
 LOCK = Path('/run/qbox-agent-job.lock')
+STARTED_AT = time.time()
 
 
 def sh(cmd, timeout=120):
@@ -46,22 +48,158 @@ def zerotier_node_id():
     return parts[2] if len(parts) >= 3 else None
 
 
+def zerotier_status():
+    info = sh('zerotier-cli info 2>/dev/null', timeout=5)
+    networks = sh('zerotier-cli listnetworks -j 2>/dev/null', timeout=8)
+    parsed = []
+    try:
+        data = json.loads(networks) if networks else []
+        for n in data:
+            parsed.append({
+                'id': n.get('nwid') or n.get('id'),
+                'name': n.get('name'),
+                'status': n.get('status'),
+                'assigned_addresses': n.get('assignedAddresses') or [],
+                'mac': n.get('mac'),
+            })
+    except Exception:
+        parsed = []
+    return {'info': info, 'node_id': zerotier_node_id(), 'networks': parsed}
+
+
 def ip_addr():
     return sh("hostname -I | awk '{print $1}'", timeout=5) or None
 
 
+def network_addresses():
+    result = []
+    for iface, addrs in psutil.net_if_addrs().items():
+        for addr in addrs:
+            if getattr(addr, 'family', None) == socket.AF_INET:
+                result.append({'interface': iface, 'address': addr.address, 'netmask': addr.netmask})
+    return result
+
+
+def docker_available():
+    return sh('command -v docker >/dev/null 2>&1 && echo yes || echo no', timeout=5) == 'yes'
+
+
+def docker_containers():
+    if not docker_available():
+        return []
+    out = sh("docker ps -a --format '{{json .}}' 2>/dev/null", timeout=20)
+    containers = []
+    for line in out.splitlines():
+        try:
+            item = json.loads(line)
+            containers.append({
+                'id': item.get('ID'),
+                'name': item.get('Names'),
+                'image': item.get('Image'),
+                'status': item.get('Status'),
+                'state': item.get('State'),
+                'ports': item.get('Ports'),
+            })
+        except Exception:
+            continue
+    return containers
+
+
+def docker_stats():
+    if not docker_available():
+        return []
+    out = sh("docker stats --no-stream --format '{{json .}}' 2>/dev/null", timeout=25)
+    stats = []
+    for line in out.splitlines():
+        try:
+            item = json.loads(line)
+            stats.append({
+                'name': item.get('Name'),
+                'cpu': item.get('CPUPerc'),
+                'memory': item.get('MemUsage'),
+                'memory_percent': item.get('MemPerc'),
+                'net_io': item.get('NetIO'),
+                'block_io': item.get('BlockIO'),
+                'pids': item.get('PIDs'),
+            })
+        except Exception:
+            continue
+    return stats
+
+
 def installed_apps():
-    out = sh('docker ps --format {{.Names}} 2>/dev/null', timeout=10)
-    return [x for x in out.splitlines() if x]
+    return [c['name'] for c in docker_containers() if c.get('state') == 'running' and c.get('name')]
+
+
+def disk_usage():
+    disks = []
+    seen = set()
+    for part in psutil.disk_partitions(all=False):
+        if part.mountpoint in seen:
+            continue
+        seen.add(part.mountpoint)
+        try:
+            usage = psutil.disk_usage(part.mountpoint)
+            disks.append({
+                'device': part.device,
+                'mountpoint': part.mountpoint,
+                'fstype': part.fstype,
+                'total_gb': round(usage.total / 1024 / 1024 / 1024, 2),
+                'used_gb': round(usage.used / 1024 / 1024 / 1024, 2),
+                'free_gb': round(usage.free / 1024 / 1024 / 1024, 2),
+                'percent': usage.percent,
+            })
+        except Exception:
+            continue
+    return disks
 
 
 def metrics():
+    cfg = load()
+    boot_time = psutil.boot_time()
+    vm = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    root_disk = psutil.disk_usage('/')
+    net = psutil.net_io_counters()
+    cpu_freq = psutil.cpu_freq()
+    load_avg = os.getloadavg() if hasattr(os, 'getloadavg') else (None, None, None)
     return {
         'hostname': socket.gethostname(),
-        'cpu_percent': psutil.cpu_percent(),
-        'mem_percent': psutil.virtual_memory().percent,
-        'disk_percent': psutil.disk_usage('/').percent,
-        'agent_version': agent_version(load()),
+        'fqdn': socket.getfqdn(),
+        'platform': platform.platform(),
+        'system': platform.system(),
+        'machine': platform.machine(),
+        'python_version': platform.python_version(),
+        'agent_version': agent_version(cfg),
+        'agent_uptime_seconds': int(time.time() - STARTED_AT),
+        'boot_time': int(boot_time),
+        'uptime_seconds': int(time.time() - boot_time),
+        'cpu_percent': psutil.cpu_percent(interval=0.3),
+        'cpu_count': psutil.cpu_count(),
+        'cpu_freq_mhz': round(cpu_freq.current, 1) if cpu_freq else None,
+        'load_avg': {'1m': load_avg[0], '5m': load_avg[1], '15m': load_avg[2]},
+        'mem_percent': vm.percent,
+        'mem_total_mb': round(vm.total / 1024 / 1024, 1),
+        'mem_available_mb': round(vm.available / 1024 / 1024, 1),
+        'swap_percent': swap.percent,
+        'disk_percent': root_disk.percent,
+        'disk_total_gb': round(root_disk.total / 1024 / 1024 / 1024, 2),
+        'disk_free_gb': round(root_disk.free / 1024 / 1024 / 1024, 2),
+        'disks': disk_usage(),
+        'network': {
+            'addresses': network_addresses(),
+            'bytes_sent': net.bytes_sent,
+            'bytes_recv': net.bytes_recv,
+            'packets_sent': net.packets_sent,
+            'packets_recv': net.packets_recv,
+        },
+        'docker': {
+            'available': docker_available(),
+            'containers': docker_containers(),
+            'stats': docker_stats(),
+        },
+        'zerotier': zerotier_status(),
+        'timestamp': int(time.time()),
     }
 
 
@@ -180,14 +318,15 @@ def run_job(cfg, token, job):
 
 def heartbeat(cfg):
     token = TOKEN.read_text().strip()
+    live_metrics = metrics()
     payload = {
         'serial': cfg['serial'],
         'firmware': cfg.get('firmware', agent_version(cfg)),
         'ip_address': ip_addr(),
         'apps': installed_apps(),
-        'metrics': metrics(),
+        'metrics': live_metrics,
     }
-    r = requests.post(cfg['central_url'].rstrip('/') + '/api/agent/heartbeat', headers={'X-Agent-Token': token}, json=payload, timeout=15)
+    r = requests.post(cfg['central_url'].rstrip('/') + '/api/agent/heartbeat', headers={'X-Agent-Token': token}, json=payload, timeout=20)
     r.raise_for_status()
     for job in r.json().get('jobs', []):
         run_job(cfg, token, job)
