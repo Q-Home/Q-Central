@@ -3,6 +3,7 @@ import {createRoot} from 'react-dom/client';
 import {Activity, AlertTriangle, Bell, Boxes, CheckSquare, CloudUpload, Cpu, Database, Eye, FileText, HardDrive, Home, LogOut, MemoryStick, Menu, Moon, Network, Package, RefreshCw, Rocket, Search, Send, Server, Shield, ShieldCheck, Smartphone, Square, Tags, Terminal, User, UserCog, Users, Wifi} from 'lucide-react';
 import './style.css';
 import InventoryModule from './components/inventory/DeviceInventory.jsx';
+import './enrollment-bootstrap.js';
 
 const api='/api';
 const roles=['superadmin','admin','support','installer','readonly'];
