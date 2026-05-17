@@ -16,6 +16,11 @@ TOKEN = Path('/etc/qbox-agent/agent-token')
 VERSION_FILE = Path('/etc/qbox-agent/version')
 LOCK = Path('/run/qbox-agent-job.lock')
 STARTED_AT = time.time()
+LOXBERRY_PLUGIN_DB_PATHS = [
+    '/opt/loxberry/config/system/plugindatabase.json',
+    '/opt/loxberry/data/system/plugindatabase.json',
+    '/opt/loxberry/system/plugindatabase.json',
+]
 
 
 def sh(cmd, timeout=120):
@@ -157,6 +162,47 @@ def loxberry_info():
     }
 
 
+def loxberry_plugin_db_path(lbhome=None):
+    candidates = list(LOXBERRY_PLUGIN_DB_PATHS)
+    if lbhome:
+        candidates.insert(0, str(Path(lbhome) / 'config/system/plugindatabase.json'))
+        candidates.insert(1, str(Path(lbhome) / 'data/system/plugindatabase.json'))
+    for candidate in candidates:
+        path = Path(candidate)
+        if path.is_file():
+            return path
+    return None
+
+
+def loxberry_plugins(lbhome=None):
+    db_path = loxberry_plugin_db_path(lbhome)
+    if not db_path:
+        return []
+    try:
+        data = json.loads(db_path.read_text(errors='ignore'))
+    except Exception:
+        return []
+    plugins = data.get('plugins') if isinstance(data, dict) else None
+    if not isinstance(plugins, dict):
+        return []
+    result = []
+    for plugin_id, plugin in plugins.items():
+        if not isinstance(plugin, dict):
+            continue
+        disabled = plugin.get('disabled')
+        result.append({
+            'id': plugin_id,
+            'type': 'loxberry_plugin',
+            'name': plugin.get('name'),
+            'version': plugin.get('version'),
+            'folder': plugin.get('folder'),
+            'author': plugin.get('author_name') or plugin.get('author'),
+            'enabled': disabled not in ('1', 1, True, 'true', 'True', 'yes', 'Yes'),
+            'autoupdate': plugin.get('autoupdate'),
+        })
+    return result
+
+
 def board_info():
     model = read_file('/proc/device-tree/model') or read_file('/sys/firmware/devicetree/base/model') or read_file('/sys/class/dmi/id/product_name')
     serial = read_file('/proc/device-tree/serial-number') or read_file('/sys/class/dmi/id/product_serial')
@@ -242,7 +288,11 @@ def docker_stats():
 
 
 def installed_apps():
-    return [c['name'] for c in docker_containers() if c.get('state') == 'running' and c.get('name')]
+    apps = [c['name'] for c in docker_containers() if c.get('state') == 'running' and c.get('name')]
+    loxberry = loxberry_info()
+    if loxberry.get('installed'):
+        apps.extend(loxberry_plugins(loxberry.get('home')))
+    return apps
 
 
 def disk_usage():
