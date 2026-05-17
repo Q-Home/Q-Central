@@ -7,17 +7,18 @@ function ensureStyles(){
   style.id='qcentral-enroll-style';
   style.textContent=`
   .enroll-fab{position:fixed;right:24px;bottom:24px;z-index:50;border:0;border-radius:999px;padding:13px 18px;background:#172b4d;color:#fff;font-weight:800;box-shadow:0 14px 34px rgba(15,23,42,.25);cursor:pointer}
+  .device-tools-fab{position:fixed;right:24px;bottom:78px;z-index:50;border:0;border-radius:999px;padding:11px 16px;background:#991b1b;color:#fff;font-weight:800;box-shadow:0 14px 34px rgba(15,23,42,.22);cursor:pointer}
   .enroll-backdrop{position:fixed;inset:0;z-index:80;background:rgba(15,23,42,.45);display:flex;align-items:center;justify-content:center;padding:24px}
-  .enroll-modal{width:min(760px,100%);background:#fff;border-radius:22px;box-shadow:0 24px 70px rgba(15,23,42,.35);padding:24px;color:#162033}
+  .enroll-modal{width:min(760px,100%);max-height:88vh;overflow:auto;background:#fff;border-radius:22px;box-shadow:0 24px 70px rgba(15,23,42,.35);padding:24px;color:#162033}
   body.dark .enroll-modal{background:#111827;color:#e5eefb}
-  .enroll-modal h2{margin:0 0 6px}.enroll-modal p{margin:0 0 18px;color:#64748b}.enroll-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.enroll-modal label{display:flex;flex-direction:column;gap:6px;font-size:13px;font-weight:700}.enroll-modal input{border:1px solid #d8e0ea;border-radius:12px;padding:11px 12px;font:inherit}.enroll-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:18px}.enroll-actions button{border:0;border-radius:12px;padding:11px 14px;font-weight:800;cursor:pointer}.enroll-primary{background:#2563eb;color:#fff}.enroll-secondary{background:#eef2f7}.enroll-command{margin-top:16px;background:#0f172a;color:#dbeafe;border-radius:14px;padding:14px;white-space:pre-wrap;word-break:break-all;font-family:ui-monospace,Menlo,monospace;font-size:12px}.enroll-error{margin-top:12px;color:#b91c1c;font-weight:700}.enroll-note{margin-top:12px;font-size:12px;color:#64748b}`;
+  .enroll-modal h2{margin:0 0 6px}.enroll-modal p{margin:0 0 18px;color:#64748b}.enroll-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.enroll-modal label{display:flex;flex-direction:column;gap:6px;font-size:13px;font-weight:700}.enroll-modal input{border:1px solid #d8e0ea;border-radius:12px;padding:11px 12px;font:inherit}.enroll-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:18px}.enroll-actions button{border:0;border-radius:12px;padding:11px 14px;font-weight:800;cursor:pointer}.enroll-primary{background:#2563eb;color:#fff}.enroll-danger{background:#dc2626;color:#fff}.enroll-secondary{background:#eef2f7}.enroll-command{margin-top:16px;background:#0f172a;color:#dbeafe;border-radius:14px;padding:14px;white-space:pre-wrap;word-break:break-all;font-family:ui-monospace,Menlo,monospace;font-size:12px}.enroll-error{margin-top:12px;color:#b91c1c;font-weight:700}.enroll-note{margin-top:12px;font-size:12px;color:#64748b}.delete-row{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:center;border:1px solid #e2e8f0;border-radius:14px;padding:12px;margin:8px 0}.delete-row strong{display:block}.delete-row small{display:block;color:#64748b}`;
   document.head.appendChild(style);
 }
 
 async function api(path,options={}){
   const r=await fetch(API+path,{credentials:'include',headers:{'Content-Type':'application/json'},...options});
   if(!r.ok){throw new Error(await r.text());}
-  return r.json();
+  return r.headers.get('content-type')?.includes('application/json')?r.json():r.text();
 }
 
 function commandFor({central,serial,claim,release}){
@@ -51,13 +52,47 @@ function openWizard(){
   };
 }
 
+async function openDeleteWizard(){
+  ensureStyles();
+  const backdrop=document.createElement('div');
+  backdrop.className='enroll-backdrop';
+  backdrop.innerHTML=`<div class="enroll-modal"><h2>Delete Device</h2><p>Verwijder oude of foutieve enrollments uit Q-Central. Dit verwijdert ook jobs en historische heartbeat logs.</p><div id="delete-list">Laden...</div><div class="enroll-actions"><button class="enroll-secondary" id="delete-close">Sluit</button></div></div>`;
+  document.body.appendChild(backdrop);
+  backdrop.querySelector('#delete-close').onclick=()=>backdrop.remove();
+  const list=backdrop.querySelector('#delete-list');
+  try{
+    const devices=await api('/devices');
+    if(!devices.length){list.innerHTML='<p class="enroll-note">Geen devices gevonden.</p>';return;}
+    list.innerHTML='';
+    devices.forEach(d=>{
+      const row=document.createElement('div');
+      row.className='delete-row';
+      row.innerHTML=`<div><strong>${d.name||d.serial}</strong><small>${d.serial} · ${d.status||'-'} · ${d.ip_address||'-'}</small></div><button class="enroll-danger">Delete</button>`;
+      row.querySelector('button').onclick=async()=>{
+        if(!confirm(`Device ${d.serial} definitief verwijderen?`)) return;
+        try{
+          await api('/devices/'+encodeURIComponent(d.serial),{method:'DELETE'});
+          row.remove();
+          window.dispatchEvent(new Event('qcentral-device-deleted'));
+        }catch(e){alert('Delete mislukt: '+String(e.message||e));}
+      };
+      list.appendChild(row);
+    });
+  }catch(e){list.innerHTML='<div class="enroll-error">'+String(e.message||e)+'</div>';}
+}
+
 function addButton(){
   if(document.querySelector('.enroll-fab')) return;
-  const btn=document.createElement('button');
-  btn.className='enroll-fab';
-  btn.textContent='+ Add Device';
-  btn.onclick=openWizard;
-  document.body.appendChild(btn);
+  const add=document.createElement('button');
+  add.className='enroll-fab';
+  add.textContent='+ Add Device';
+  add.onclick=openWizard;
+  document.body.appendChild(add);
+  const del=document.createElement('button');
+  del.className='device-tools-fab';
+  del.textContent='Delete Device';
+  del.onclick=openDeleteWizard;
+  document.body.appendChild(del);
 }
 
 window.addEventListener('load',()=>setTimeout(addButton,800));
