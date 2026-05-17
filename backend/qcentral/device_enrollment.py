@@ -1,10 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import PlainTextResponse
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from .config import get_settings
 from .db import get_session
-from .models import Device
+from .models import AuditLog, Device, Job
 from .schemas import RegisterSerialRequest, RegisterSerialResponse
 from .security import hash_secret, new_token, require_admin
 from .software import _agent_releases
@@ -23,6 +23,23 @@ def add_device(body: RegisterSerialRequest, session: Session = Depends(get_sessi
     session.add(device)
     session.commit()
     return RegisterSerialResponse(serial=body.serial, claim_token=claim_token)
+
+
+@router.delete('/{serial}')
+def delete_device(serial: str, session: Session = Depends(get_session), actor: str = Depends(require_admin)):
+    device = session.get(Device, serial)
+    if not device:
+        raise HTTPException(status_code=404, detail='device not found')
+    jobs = session.exec(select(Job).where(Job.serial == serial)).all()
+    old_logs = session.exec(select(AuditLog).where(AuditLog.serial == serial)).all()
+    for job in jobs:
+        session.delete(job)
+    for log in old_logs:
+        session.delete(log)
+    session.delete(device)
+    session.add(AuditLog(event='device_deleted', actor=actor, serial=serial, detail='device, jobs and historical heartbeat logs removed'))
+    session.commit()
+    return {'ok': True, 'serial': serial, 'deleted_jobs': len(jobs), 'deleted_logs': len(old_logs)}
 
 
 @router.post('/add-command')
