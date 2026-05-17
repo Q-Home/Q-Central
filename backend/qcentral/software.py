@@ -7,7 +7,7 @@ from sqlmodel import Session, select
 
 from .config import get_settings
 from .db import get_session
-from .models import Device, Job
+from .models import AuditLog, Device, Job
 from .security import require_admin
 
 router = APIRouter(prefix="/api/software", tags=["Software Repository"])
@@ -16,7 +16,9 @@ stripped_router = APIRouter(prefix="/software", tags=["Software Repository"])
 AGENT_ASSET_PREFIX = "qbox-agent-"
 MAX_RELEASES = 30
 OTA_STATUSES = ["queued", "downloading", "installing", "rebooting", "success", "failed"]
-STATUS_PROGRESS = {"queued": 0, "downloading": 25, "installing": 60, "rebooting": 85, "accepted": 85, "done": 100, "success": 100, "failed": 100}
+STATUS_PROGRESS = {"queued": 0, "downloading": 25, "installing": 60, "rebooting": 85, "accepted": 85, "running": 85, "in_progress": 85, "done": 100, "success": 100, "failed": 100}
+ACTIVE_AGENT_UPDATE_STATUSES = {"downloading", "verifying", "installing", "rebooting", "accepted", "running", "in_progress"}
+FINAL_AGENT_UPDATE_STATUSES = {"success", "failed", "done", "cancelled"}
 
 
 def github_repo() -> str:
@@ -100,7 +102,7 @@ def job_result(job: Job) -> dict:
 def normalized_job_status(job: Job) -> str:
     if job.status == "done":
         return "success"
-    if job.status == "accepted":
+    if job.status in {"accepted", "running", "in_progress"}:
         return "rebooting"
     return job.status
 
@@ -112,6 +114,43 @@ def job_progress(job: Job) -> int:
     return STATUS_PROGRESS.get(normalized_job_status(job), 0)
 
 
+def _latest_agent_version(session: Session, serial: str) -> str | None:
+    last_hb = session.exec(select(AuditLog).where(AuditLog.serial == serial, AuditLog.event == "heartbeat").order_by(AuditLog.created_at.desc()).limit(1)).first()
+    detail = safe_json(last_hb.detail if last_hb else None)
+    metrics = detail.get("metrics") if isinstance(detail.get("metrics"), dict) else {}
+    return normalize_version(metrics.get("agent_version") or metrics.get("version"))
+
+
+def auto_complete_agent_update_jobs(session: Session, serial: str | None = None) -> None:
+    stmt = select(Job).where(Job.kind == "agent_update")
+    if serial:
+        stmt = stmt.where(Job.serial == serial)
+    jobs = session.exec(stmt.order_by(Job.created_at.desc()).limit(250)).all()
+    versions: dict[str, str | None] = {}
+    changed = False
+    for job in jobs:
+        if job.status in FINAL_AGENT_UPDATE_STATUSES:
+            continue
+        if job.status not in ACTIVE_AGENT_UPDATE_STATUSES:
+            continue
+        payload = job_payload(job)
+        target_version = normalize_version(payload.get("version") or payload.get("target_version"))
+        if not target_version:
+            continue
+        if job.serial not in versions:
+            versions[job.serial] = _latest_agent_version(session, job.serial)
+        if versions[job.serial] != target_version:
+            continue
+        result = {"status": "success", "progress": 100, "message": f"Heartbeat confirmed agent version {target_version}", "agent_version": target_version, "completed_by": "software_snapshot"}
+        job.status = "success"
+        job.result = json.dumps(result)[:4000]
+        job.updated_at = datetime.now(timezone.utc)
+        session.add(job)
+        changed = True
+    if changed:
+        session.commit()
+
+
 def job_row(job: Job) -> dict:
     payload = job_payload(job)
     result = job_result(job)
@@ -119,6 +158,7 @@ def job_row(job: Job) -> dict:
 
 
 def software_jobs_snapshot(session: Session, serial: str | None = None) -> dict:
+    auto_complete_agent_update_jobs(session, serial)
     stmt = select(Job).order_by(Job.created_at.desc()).limit(250)
     if serial:
         stmt = select(Job).where(Job.serial == serial).order_by(Job.created_at.desc()).limit(250)
