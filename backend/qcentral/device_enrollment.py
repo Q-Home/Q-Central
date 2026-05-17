@@ -70,9 +70,9 @@ if command -v zerotier-cli >/dev/null 2>&1 && [ -n "$ZEROTIER_NETWORK" ]; then
 fi
 install -d -m 0755 /etc/qbox-agent /opt/qbox-agent
 cat > /etc/qbox-agent/config.json <<JSON
-{{"serial":"$SERIAL","central_url":"${{CENTRAL_URL%/}}"}}
+{{"serial":"$SERIAL","claim_token":"$CLAIM_TOKEN","central_url":"${{CENTRAL_URL%/}}","firmware":"{version}"}}
 JSON
-chmod 0644 /etc/qbox-agent/config.json
+chmod 0600 /etc/qbox-agent/config.json
 workdir=$(mktemp -d /tmp/qbox-agent-install.XXXXXX)
 trap 'rm -rf "$workdir"' EXIT
 curl -fsSL {url!r} -o "$workdir/agent.tar.gz"
@@ -85,14 +85,6 @@ python3 -m venv /opt/qbox-agent/venv
 /opt/qbox-agent/venv/bin/pip install --upgrade pip
 /opt/qbox-agent/venv/bin/pip install -r /opt/qbox-agent/requirements.txt
 printf '%s\n' {version!r} > /etc/qbox-agent/version
-PROVISION_RESPONSE=$(curl -fsSL -X POST "${{CENTRAL_URL%/}}/api/provision" -H 'Content-Type: application/json' -d "{{\"serial\":\"$SERIAL\",\"claim_token\":\"$CLAIM_TOKEN\"}}")
-python3 - <<PY
-import json
-from pathlib import Path
-data=json.loads('''$PROVISION_RESPONSE''')
-Path('/etc/qbox-agent/agent-token').write_text(data['agent_token']+'\n')
-PY
-chmod 0600 /etc/qbox-agent/agent-token
 cat > /etc/systemd/system/qbox-agent.service <<'UNIT'
 [Unit]
 Description=Q-Box Agent
@@ -110,7 +102,12 @@ User=root
 WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload
+rm -f /etc/qbox-agent/agent-token
+/opt/qbox-agent/venv/bin/python -m qbox_agent --once --provision
 systemctl enable --now qbox-agent.service
-echo "Q-Box agent installed. Serial: $SERIAL"
+systemctl restart qbox-agent.service
+sleep 2
+systemctl --no-pager --full status qbox-agent.service | head -n 25 || true
+echo "Q-Box agent installed and provisioned. Serial: $SERIAL"
 '''
     return script
