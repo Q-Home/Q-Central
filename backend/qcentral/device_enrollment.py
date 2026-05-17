@@ -93,6 +93,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+WorkingDirectory=/opt/qbox-agent
 ExecStart=/opt/qbox-agent/venv/bin/python -m qbox_agent
 Restart=always
 RestartSec=10
@@ -103,6 +104,7 @@ WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload
 rm -f /etc/qbox-agent/agent-token
+cd /opt/qbox-agent
 /opt/qbox-agent/venv/bin/python -m qbox_agent --once --provision
 systemctl enable --now qbox-agent.service
 systemctl restart qbox-agent.service
