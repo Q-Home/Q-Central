@@ -14,6 +14,7 @@ from .models import AuditLog, Device, DeviceStatus, Job, User, UserRole
 from .schemas import HeartbeatRequest, JobCreateRequest, LoginRequest, ProfileUpdateRequest, ProvisionRequest, ProvisionResponse, RegisterSerialRequest, RegisterSerialResponse, UserCreateRequest, UserUpdateRequest
 from .security import SESSION_COOKIE_NAME, authenticate_admin, create_admin_session, hash_secret, new_token, require_admin, require_agent_token, require_portal_token, verify_secret
 from .software import router as software_router, stripped_router as stripped_software_router, software_jobs_snapshot
+from .device_enrollment import router as device_enrollment_router
 from .zerotier import authorize_member
 
 ALLOWED_JOB_KINDS = {"agent_update", "app_update", "app_restart", "compose_pull"}
@@ -21,12 +22,13 @@ ADMIN_ROLES = {"superadmin", "admin"}
 
 settings = get_settings()
 limiter = Limiter(key_func=get_remote_address, default_limits=["240/minute"])
-app = FastAPI(title="Q-Central API", version="1.2.3")
+app = FastAPI(title="Q-Central API", version="1.2.4")
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
-app.add_middleware(CORSMiddleware, allow_origins=settings.cors_list, allow_credentials=True, allow_methods=["GET", "POST", "PATCH"], allow_headers=["Content-Type", "Authorization", "X-Agent-Token", "X-Portal-Token"])
+app.add_middleware(CORSMiddleware, allow_origins=settings.cors_list, allow_credentials=True, allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Content-Type", "Authorization", "X-Agent-Token", "X-Portal-Token"])
 app.include_router(software_router)
 app.include_router(stripped_software_router)
+app.include_router(device_enrollment_router)
 
 
 @app.exception_handler(RateLimitExceeded)
