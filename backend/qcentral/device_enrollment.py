@@ -10,8 +10,24 @@ from .security import hash_secret, new_token, require_admin
 from .software import _agent_releases
 
 router = APIRouter(prefix='/api/devices', tags=['Devices'])
+compat_router = APIRouter(tags=['Devices'])
 
 ZEROTIER_NETWORK_ID = '9445e68adada0b99'
+
+
+def _delete_device(serial: str, session: Session, actor: str):
+    device = session.get(Device, serial)
+    if not device:
+        raise HTTPException(status_code=404, detail='device not found')
+    jobs = session.exec(select(Job).where(Job.serial == serial)).all()
+    old_logs = session.exec(select(AuditLog).where(AuditLog.serial == serial)).all()
+    for job in jobs:
+        session.delete(job)
+    for log in old_logs:
+        session.delete(log)
+    session.delete(device)
+    session.commit()
+    return {'ok': True, 'serial': serial, 'deleted_jobs': len(jobs), 'deleted_logs': len(old_logs)}
 
 
 @router.post('/add', response_model=RegisterSerialResponse)
@@ -27,19 +43,27 @@ def add_device(body: RegisterSerialRequest, session: Session = Depends(get_sessi
 
 @router.delete('/{serial}')
 def delete_device(serial: str, session: Session = Depends(get_session), actor: str = Depends(require_admin)):
-    device = session.get(Device, serial)
-    if not device:
-        raise HTTPException(status_code=404, detail='device not found')
-    jobs = session.exec(select(Job).where(Job.serial == serial)).all()
-    old_logs = session.exec(select(AuditLog).where(AuditLog.serial == serial)).all()
-    for job in jobs:
-        session.delete(job)
-    for log in old_logs:
-        session.delete(log)
-    session.delete(device)
-    session.add(AuditLog(event='device_deleted', actor=actor, serial=serial, detail='device, jobs and historical heartbeat logs removed'))
-    session.commit()
-    return {'ok': True, 'serial': serial, 'deleted_jobs': len(jobs), 'deleted_logs': len(old_logs)}
+    return _delete_device(serial, session, actor)
+
+
+@compat_router.delete('/api/device/{serial}')
+def delete_device_singular(serial: str, session: Session = Depends(get_session), actor: str = Depends(require_admin)):
+    return _delete_device(serial, session, actor)
+
+
+@compat_router.delete('/api/serials/{serial}')
+def delete_device_serials(serial: str, session: Session = Depends(get_session), actor: str = Depends(require_admin)):
+    return _delete_device(serial, session, actor)
+
+
+@compat_router.post('/api/devices/{serial}/delete')
+def delete_device_post(serial: str, session: Session = Depends(get_session), actor: str = Depends(require_admin)):
+    return _delete_device(serial, session, actor)
+
+
+@compat_router.post('/api/device/{serial}/delete')
+def delete_device_post_singular(serial: str, session: Session = Depends(get_session), actor: str = Depends(require_admin)):
+    return _delete_device(serial, session, actor)
 
 
 @router.post('/add-command')
