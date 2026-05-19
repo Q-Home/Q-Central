@@ -12,6 +12,7 @@
 - Generate secrets with `openssl rand -hex 32`.
 - Never commit `.env`.
 - Rotate `Q_CENTRAL_ADMIN_TOKEN` after setup.
+- Store only `Q_CENTRAL_PORTAL_TOKEN_HASH` in Q-Central and rotate the Q-Portal plaintext token periodically.
 - Device claim tokens are one-time secrets.
 - Device agent tokens are per-device secrets.
 
