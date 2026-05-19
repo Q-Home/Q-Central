@@ -32,6 +32,34 @@ Then open:
 https://<Q_CENTRAL_HOSTNAME>
 ```
 
+## Q-Portal integration
+
+Q-Portal uses the read-only Portal API to look up Q-Box devices. Generate a dedicated token and bcrypt hash:
+
+```bash
+./scripts/create-portal-token.sh
+```
+
+Put the generated hash in the Q-Central production env:
+
+```env
+Q_CENTRAL_PORTAL_TOKEN_HASH=$2b$...
+```
+
+Put the generated plaintext token in Q-Portal:
+
+```env
+QCENTRAL_PORTAL_TOKEN=qcp_...
+QCENTRAL_BASE_URL=https://central.q-home.be
+```
+
+After restarting Q-Central, this should return device data instead of `portal api not configured`:
+
+```bash
+curl -H "X-Portal-Token: $QCENTRAL_PORTAL_TOKEN" \
+  https://central.q-home.be/api/portal/device/QBX-TEST-0002
+```
+
 ## First device provisioning
 
 On Central, create a serial:

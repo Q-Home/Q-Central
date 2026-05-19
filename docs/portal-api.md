@@ -38,6 +38,14 @@ The token is stored server-side as a bcrypt hash in the production `.env` file:
 Q_CENTRAL_PORTAL_TOKEN_HASH=$2b$...
 ```
 
+Generate a token/hash pair from the repository root:
+
+```bash
+./scripts/create-portal-token.sh
+```
+
+Use the plaintext token in Q-Portal as `QCENTRAL_PORTAL_TOKEN`; only the bcrypt hash belongs in Q-Central.
+
 ## Endpoints
 
 ### Lookup device by serial
