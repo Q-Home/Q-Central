@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Any
 
 
@@ -24,6 +24,7 @@ class UserCreateRequest(BaseModel):
 
 
 class UserUpdateRequest(BaseModel):
+    username: str | None = None
     role: str | None = None
     full_name: str | None = None
     email: str | None = None
@@ -64,8 +65,8 @@ class HeartbeatRequest(BaseModel):
     serial: str
     firmware: str | None = None
     ip_address: str | None = None
-    apps: list[str] = []
-    metrics: dict[str, Any] = {}
+    apps: list[Any] = Field(default_factory=list)
+    metrics: dict[str, Any] = Field(default_factory=dict)
 
 
 class JobCreateRequest(BaseModel):
