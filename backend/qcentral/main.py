@@ -226,7 +226,7 @@ def list_users(actor: str = Depends(require_admin), session: Session = Depends(g
 def create_user(body: UserCreateRequest, actor: str = Depends(require_admin), session: Session = Depends(get_session)):
     require_admin_role(session, actor)
     if session.get(User, body.username):
-        raise HTTPException(status_code=409, detail="serial already exists")
+        raise HTTPException(status_code=409, detail="user already exists")
     if body.role not in [r.value for r in UserRole]:
         raise HTTPException(status_code=400, detail="invalid role")
     if len(body.initial_value) < 10:
@@ -394,7 +394,7 @@ def create_agent_update_job(body: dict, session: Session = Depends(get_session),
     if not session.get(Device, serial):
         raise HTTPException(status_code=404, detail="device not found")
     payload = {"url": body["url"], "sha256": body["sha256"], "version": body.get("version")}
-    job = Job(serial=serial, kind="agent_update", payload_json=json.dumps(body.payload))
+    job = Job(serial=serial, kind="agent_update", payload_json=json.dumps(payload))
     session.add(job)
     audit(session, "agent_update_queued", actor, serial, json.dumps(payload))
     session.commit()
