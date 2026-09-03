@@ -226,7 +226,7 @@ def list_users(actor: str = Depends(require_admin), session: Session = Depends(g
 def create_user(body: UserCreateRequest, actor: str = Depends(require_admin), session: Session = Depends(get_session)):
     require_admin_role(session, actor)
     if session.get(User, body.username):
-        raise HTTPException(status_code=409, detail="user already exists")
+        raise HTTPException(status_code=409, detail="serial already exists")
     if body.role not in [r.value for r in UserRole]:
         raise HTTPException(status_code=400, detail="invalid role")
     if len(body.initial_value) < 10:
@@ -360,7 +360,7 @@ def heartbeat(request: Request, body: HeartbeatRequest, session: Session = Depen
     device.last_seen = datetime.now(timezone.utc)
     device.updated_at = datetime.now(timezone.utc)
     session.add(device)
-    audit(session, "heartbeat", "agent", body.serial, json.dumps({"apps": body.apps, "metrics": body.metrics})[:5000])
+    audit(session, "heartbeat", "agent", body.serial, json.dumps({"apps": body.apps, "metrics": body.metrics}))
     session.commit()
     jobs = session.exec(select(Job).where(Job.serial == body.serial, Job.status == "queued").order_by(Job.created_at)).all()
     return {"ok": True, "jobs": jobs}
@@ -394,7 +394,7 @@ def create_agent_update_job(body: dict, session: Session = Depends(get_session),
     if not session.get(Device, serial):
         raise HTTPException(status_code=404, detail="device not found")
     payload = {"url": body["url"], "sha256": body["sha256"], "version": body.get("version")}
-    job = Job(serial=serial, kind="agent_update", payload_json=json.dumps(payload))
+    job = Job(serial=serial, kind="agent_update", payload_json=json.dumps(body.payload))
     session.add(job)
     audit(session, "agent_update_queued", actor, serial, json.dumps(payload))
     session.commit()
