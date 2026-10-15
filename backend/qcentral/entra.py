@@ -1,4 +1,5 @@
 """Microsoft Entra OIDC login; Microsoft tokens never leave the API."""
+import logging
 import time
 from datetime import datetime, timezone
 from uuid import UUID
@@ -17,6 +18,7 @@ from .models import AuditLog, User, UserRole
 from .security import SESSION_COOKIE_NAME, create_admin_session
 
 router = APIRouter(tags=["Auth"])
+logger = logging.getLogger(__name__)
 settings = get_settings()
 oauth = OAuth()
 issuer = f"https://login.microsoftonline.com/{settings.entra_tenant_id}/v2.0"
@@ -30,20 +32,42 @@ if settings.entra_configured:
     )
 
 
+class LoginPolicyError(ValueError):
+    """A fixed diagnostic code, never an upstream error description or token."""
+
+
+def login_failure_reason(exc: Exception) -> str:
+    if isinstance(exc, LoginPolicyError):
+        return str(exc)
+    if isinstance(exc, OAuthError):
+        code = exc.error
+        if code in {"invalid_client", "invalid_grant", "access_denied", "mismatching_state", "invalid_request", "unauthorized_client"}:
+            return code
+        return "oauth_failed"
+    if isinstance(exc, JoseError):
+        return "id_token_validation_failed"
+    if isinstance(exc, httpx.HTTPError):
+        return "microsoft_request_failed"
+    return "invalid_login_response"
+
+
 def identity_from_claims(claims: dict) -> tuple[str, UserRole]:
     """Accept only assigned administrators from the configured tenant."""
     if claims.get("tid") != str(settings.entra_tenant_id):
-        raise ValueError("incorrect tenant")
-    oid = str(UUID(claims.get("oid", "")))
+        raise LoginPolicyError("incorrect_tenant")
+    try:
+        oid = str(UUID(claims.get("oid", "")))
+    except (ValueError, TypeError, AttributeError):
+        raise LoginPolicyError("invalid_object_id") from None
     roles = claims.get("roles", [])
     if not isinstance(roles, list):
-        raise ValueError("invalid roles")
+        raise LoginPolicyError("invalid_roles_claim")
     if "QCentral.SuperAdmin" in roles:
         role = UserRole.superadmin
     elif "QCentral.Admin" in roles:
         role = UserRole.admin
     else:
-        raise ValueError("Q-Central administrator role required")
+        raise LoginPolicyError("missing_qcentral_role")
     return f"entra:{settings.entra_tenant_id}:{oid}", role
 
 
@@ -79,14 +103,17 @@ async def entra_callback(request: Request, session: Session = Depends(get_sessio
         )
         claims = token.get("userinfo")
         if not claims:
-            raise ValueError("missing ID token")
+            raise LoginPolicyError("missing_id_token")
         username, role = identity_from_claims(claims)
         expires_at = min(int(claims["exp"]), int(time.time()) + settings.entra_session_minutes * 60)
         if expires_at <= int(time.time()):
-            raise ValueError("expired ID token")
-    except (OAuthError, JoseError, httpx.HTTPError, ValueError, TypeError, KeyError):
+            raise LoginPolicyError("expired_id_token")
+    except (OAuthError, JoseError, httpx.HTTPError, ValueError, TypeError, KeyError) as exc:
+        reason = login_failure_reason(exc)
+        # Upstream descriptions, request URLs and exception reprs can contain credentials.
+        logger.warning("Entra login failed: reason=%s error_type=%s", reason, type(exc).__name__)
         request.session.clear()
-        session.add(AuditLog(event="entra_login_failed", actor="anonymous"))
+        session.add(AuditLog(event="entra_login_failed", actor="anonymous", detail=reason))
         session.commit()
         response = RedirectResponse(str(settings.external_url).rstrip("/") + "/?auth_error=entra", status_code=303)
         response.delete_cookie(SESSION_COOKIE_NAME, path="/")

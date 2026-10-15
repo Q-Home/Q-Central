@@ -127,6 +127,24 @@ class EntraTests(unittest.TestCase):
         self.assertIn("auth_error", response.headers["location"])
         fetch.assert_not_awaited()
 
+    def test_missing_role_is_reported_in_server_log(self):
+        with self.assertLogs("qcentral.entra", level="WARNING") as logged:
+            response, _, _ = self.callback({"roles": ["Portal.Admin"]})
+        self.assertIn("auth_error", response.headers["location"])
+        self.assertIn("reason=missing_qcentral_role", " ".join(logged.output))
+
+    def test_invalid_secret_diagnostic_does_not_log_upstream_description(self):
+        from authlib.integrations.base_client.errors import OAuthError
+        flow = self.start_flow()
+        error = OAuthError(error="invalid_client", description="sensitive-secret-and-token")
+        with patch.object(self.remote, "fetch_access_token", AsyncMock(side_effect=error)):
+            with self.assertLogs("qcentral.entra", level="WARNING") as logged:
+                self.client.get("/api/auth/entra/callback", params={"code": "private-code", "state": flow["state"][0]})
+        output = " ".join(logged.output)
+        self.assertIn("reason=invalid_client", output)
+        self.assertNotIn("sensitive-secret-and-token", output)
+        self.assertNotIn("private-code", output)
+
     def test_superadmin_and_short_token_lifetime(self):
         response, _, _ = self.callback({"roles": ["QCentral.SuperAdmin"], "exp": int(time.time()) + 120})
         self.assertNotIn("auth_error", response.headers["location"])

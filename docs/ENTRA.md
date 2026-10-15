@@ -66,5 +66,23 @@ Test daarna met de echte tenant: bevoegde beheerder, gebruiker zonder app-rol,
 verkeerde tenant, verlopen sessie en afmelden. Een echte Microsoft-login vereist
 de bovenstaande externe configuratie.
 
+Bij een mislukte login blijft de browsermelding algemeen. De API-log en het
+audit-event `entra_login_failed` bevatten wel een vaste diagnosecode, zonder tokens,
+secrets of ruwe Microsoft-foutbeschrijvingen. Bekijk na een nieuwe poging:
+
+```bash
+cd /opt/Q-Central/deploy
+docker compose -f docker-compose.production.yml logs --since=5m api
+```
+
+- `missing_qcentral_role`: geldig gecontroleerd ID-token, maar geen exacte
+  `QCentral.Admin`/`QCentral.SuperAdmin`-rol. Controleer app-role Values en de
+  toewijzing van de bestaande groep aan de Q-Central Enterprise Application.
+- `invalid_client`: Microsoft weigert de appcredentials. Controleer dat client-ID
+  en secret-value bij dezelfde appregistratie horen en dat het secret geldig is.
+- `mismatching_state`: start een nieuwe login vanuit Q-Central, met cookies toegestaan.
+- `id_token_validation_failed`: controle van handtekening/claims mislukt; onderzoek
+  de configuratie en serverklok. De foutklasse staat naast de diagnosecode.
+
 Protocol: [Microsoft authorization code flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow).
 Library: [Authlib Starlette OIDC](https://docs.authlib.org/en/latest/client/starlette.html).
