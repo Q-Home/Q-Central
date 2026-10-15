@@ -26,7 +26,7 @@ Supported job types:
 
 ```bash
 curl -fsS -X POST "$QCENTRAL_URL/api/jobs/agent-update" \
-  -H "X-Admin-Token: $QCENTRAL_ADMIN_TOKEN" \
+  -H "Authorization: Bearer $QCENTRAL_SESSION_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "serial":"QBX-2026-0001",
@@ -42,7 +42,7 @@ The agent calls `/opt/qbox-agent/update-agent.sh` through `systemd-run`. This pr
 
 ```bash
 curl -fsS -X POST "$QCENTRAL_URL/api/jobs/app-update" \
-  -H "X-Admin-Token: $QCENTRAL_ADMIN_TOKEN" \
+  -H "Authorization: Bearer $QCENTRAL_SESSION_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "serial":"QBX-2026-0001",

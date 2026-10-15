@@ -70,8 +70,15 @@ expect_code GET /healthz 200
 # Public OpenAPI must always exist.
 expect_code GET /openapi.json 200
 
+expect_code GET /api/auth/config 200
+AUTH_CONFIG="$(cat /tmp/qcentral-smoke-body.txt)"
 # Caddy may preserve /api or strip /api. Both compatibility route sets must exist.
-if [[ -n "$ADMIN_PASSWORD" ]]; then
+if [[ "$AUTH_CONFIG" == *'"provider":"entra"'* ]]; then
+  expect_code POST /api/auth/login 403 '{"username":"admin","password":"wrong"}'
+  expect_code GET /api/auth/me 401
+  expect_code GET /api/devices 401
+  echo "[SMOKE] Entra mode: complete interactive Microsoft login to verify assigned access."
+elif [[ -n "$ADMIN_PASSWORD" ]]; then
   LOGIN_BODY="{\"username\":\"${ADMIN_USER}\",\"password\":\"${ADMIN_PASSWORD}\"}"
   expect_code POST /api/auth/login 200 "$LOGIN_BODY"
   expect_code GET /api/auth/me 200

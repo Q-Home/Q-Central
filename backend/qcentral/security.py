@@ -25,11 +25,11 @@ def new_token(prefix: str = "qct") -> str:
     return f"{prefix}_{secrets.token_urlsafe(32)}"
 
 
-def create_admin_session(username: str) -> str:
+def create_admin_session(username: str, *, provider: str = "local", expires_at: int | None = None) -> str:
     settings = get_settings()
     now = datetime.now(timezone.utc)
     exp = now + timedelta(minutes=settings.session_minutes)
-    payload = {"sub": username, "role": "admin", "iat": int(now.timestamp()), "exp": int(exp.timestamp())}
+    payload = {"sub": username, "role": "admin", "provider": provider, "iat": int(now.timestamp()), "exp": min(int(exp.timestamp()), expires_at) if expires_at is not None else int(exp.timestamp())}
     return jwt.encode(payload, settings.secret_key, algorithm=JWT_ALGORITHM)
 
 
@@ -41,13 +41,15 @@ def verify_admin_session(token: str | None) -> str:
         payload = jwt.decode(token, settings.secret_key, algorithms=[JWT_ALGORITHM])
     except JWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid admin session")
-    if payload.get("role") != "admin" or not payload.get("sub"):
+    if payload.get("role") != "admin" or not payload.get("sub") or payload.get("provider", "local") != settings.auth_mode:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid admin session")
     return str(payload["sub"])
 
 
 def authenticate_admin(username: str, supplied_value: str) -> bool:
     settings = get_settings()
+    if settings.auth_mode != "local":
+        return False
     if not secrets.compare_digest(username, settings.admin_username):
         return False
     return verify_secret(supplied_value, settings.admin_credential_hash)

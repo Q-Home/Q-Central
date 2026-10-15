@@ -1,5 +1,7 @@
 from functools import lru_cache
-from pydantic import AnyHttpUrl, Field, field_validator
+from typing import Literal
+from uuid import UUID
+from pydantic import AnyHttpUrl, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,7 +15,12 @@ class Settings(BaseSettings):
     cache_url: str | None = None
     secret_key: str = Field(min_length=32)
     admin_username: str = "admin"
-    admin_credential_hash: str = Field(min_length=20)
+    admin_credential_hash: str | None = Field(default=None, min_length=20)
+    auth_mode: Literal["entra", "local"] = "entra"
+    entra_tenant_id: UUID | None = None
+    entra_client_id: UUID | None = None
+    entra_client_secret: str | None = None
+    entra_session_minutes: int = Field(default=15, ge=1, le=60)
     admin_role: str = "admin"
     mfa_required: bool = False
     mfa_seed: str | None = None
@@ -30,12 +37,33 @@ class Settings(BaseSettings):
     ota_public_key_pem: str | None = None
     geoip_allowed_countries: str = ""
 
+    @field_validator("entra_tenant_id", "entra_client_id", "entra_client_secret", mode="before")
+    @classmethod
+    def blank_entra_value(cls, value):
+        return None if isinstance(value, str) and not value.strip() else value
+
     @field_validator("secret_key", "admin_credential_hash")
     @classmethod
-    def reject_defaults(cls, value: str) -> str:
-        if value.startswith("change-me") or value.startswith("replace-"):
+    def reject_defaults(cls, value: str | None) -> str | None:
+        if value and (value.startswith("change-me") or value.startswith("replace-")):
             raise ValueError("production credential values must be changed")
         return value
+
+    @model_validator(mode="after")
+    def validate_auth(self):
+        if self.auth_mode == "local" and not self.admin_credential_hash:
+            raise ValueError("local authentication requires an admin credential hash")
+        if self.auth_mode == "entra" and self.external_url.scheme != "https":
+            raise ValueError("Entra authentication requires an HTTPS external URL")
+        return self
+
+    @property
+    def entra_configured(self) -> bool:
+        return bool(self.entra_tenant_id and self.entra_client_id and self.entra_client_secret)
+
+    @property
+    def entra_redirect_uri(self) -> str:
+        return str(self.external_url).rstrip("/") + "/api/auth/entra/callback"
 
     @property
     def cors_list(self) -> list[str]:

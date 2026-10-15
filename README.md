@@ -6,6 +6,7 @@ Production-ready selfhosted control plane for Q-Box devices over a ZeroTier over
 
 - **Central API**: provisioning, serial registry, auto authorization, customer mapping, OTA/job queue, app manager, inventory.
 - **Frontend**: Q-Central dashboard.
+- **Authentication**: Microsoft Entra ID, with assigned Q-Central administrator roles. See [Entra setup](docs/ENTRA.md).
 - **Q-Box Agent**: lightweight Python agent installed on each Q-Box. It talks to Central over the ZeroTier overlay.
 - **Deploy stack**: Docker Compose, Caddy reverse proxy, non-root containers, health checks, env validation and backup scripts.
 
@@ -114,7 +115,7 @@ Queue an agent update:
 
 ```bash
 curl -fsS -X POST "$QCENTRAL_URL/api/jobs/agent-update" \
-  -H "X-Admin-Token: $QCENTRAL_ADMIN_TOKEN" \
+  -H "Authorization: Bearer $QCENTRAL_SESSION_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"serial":"QBX-2026-0001","url":"https://github.com/Q-Home/Q-Central/releases/download/agent-v1.0.1/qbox-agent-v1.0.1.tar.gz","sha256":"<sha256>","version":"1.0.1"}'
 ```
@@ -123,7 +124,7 @@ Update an app bundle on a Q-Box:
 
 ```bash
 curl -fsS -X POST "$QCENTRAL_URL/api/jobs/app-update" \
-  -H "X-Admin-Token: $QCENTRAL_ADMIN_TOKEN" \
+  -H "Authorization: Bearer $QCENTRAL_SESSION_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"serial":"QBX-2026-0001","path":"/storage/dockers/q-energy-ai","compose_file":"docker-compose.yml"}'
 ```

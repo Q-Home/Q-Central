@@ -11,7 +11,8 @@
 
 - Generate secrets with `openssl rand -hex 32`.
 - Never commit `.env`.
-- Rotate `Q_CENTRAL_ADMIN_TOKEN` after setup.
+- Configure Entra app-role assignments and Conditional Access as described in [ENTRA.md](ENTRA.md).
+- Rotate `Q_CENTRAL_ENTRA_CLIENT_SECRET` before it expires.
 - Store only `Q_CENTRAL_PORTAL_TOKEN_HASH` in Q-Central and rotate the Q-Portal plaintext token periodically.
 - Device claim tokens are one-time secrets.
 - Device agent tokens are per-device secrets.

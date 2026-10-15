@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.sessions import SessionMiddleware
 from sqlmodel import Session, select
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
@@ -12,10 +13,11 @@ from .config import get_settings
 from .db import get_session
 from .models import AuditLog, Device, DeviceStatus, Job, User, UserRole
 from .schemas import HeartbeatRequest, JobCreateRequest, LoginRequest, ProfileUpdateRequest, ProvisionRequest, ProvisionResponse, RegisterSerialRequest, RegisterSerialResponse, UserCreateRequest, UserUpdateRequest
-from .security import SESSION_COOKIE_NAME, authenticate_admin, create_admin_session, hash_secret, new_token, require_admin, require_agent_token, require_portal_token, verify_secret
+from .security import SESSION_COOKIE_NAME, authenticate_admin, create_admin_session, hash_secret, new_token, require_admin, require_agent_token, require_portal_token, verify_secret, verify_admin_session
 from .software import router as software_router, stripped_router as stripped_software_router, software_jobs_snapshot
 from .device_enrollment import router as device_enrollment_router
 from .zerotier import authorize_member
+from .entra import router as entra_router
 
 ALLOWED_JOB_KINDS = {"agent_update", "app_update", "app_restart", "compose_pull"}
 ADMIN_ROLES = {"superadmin", "admin"}
@@ -24,11 +26,14 @@ settings = get_settings()
 limiter = Limiter(key_func=get_remote_address, default_limits=["240/minute"])
 app = FastAPI(title="Q-Central API", version="1.2.4")
 app.state.limiter = limiter
+app.add_middleware(SessionMiddleware, secret_key=settings.secret_key, session_cookie="qcentral_oidc",
+                   max_age=600, same_site="lax", https_only=True)
 app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(CORSMiddleware, allow_origins=settings.cors_list, allow_credentials=True, allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Content-Type", "Authorization", "X-Agent-Token", "X-Portal-Token"])
 app.include_router(software_router)
 app.include_router(stripped_software_router)
 app.include_router(device_enrollment_router)
+app.include_router(entra_router)
 
 
 @app.exception_handler(RateLimitExceeded)
@@ -69,14 +74,14 @@ def as_utc_naive(value):
 
 
 def user_payload(user: User) -> dict:
-    return {"username": user.username, "role": user.role.value if hasattr(user.role, "value") else str(user.role), "full_name": user.full_name, "email": user.email, "is_active": user.is_active, "mfa_enabled": user.mfa_enabled, "created_at": user.created_at.isoformat() if user.created_at else None, "updated_at": user.updated_at.isoformat() if user.updated_at else None, "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None}
+    return {"username": user.username, "role": user.role.value if hasattr(user.role, "value") else str(user.role), "auth_provider": settings.auth_mode, "full_name": user.full_name, "email": user.email, "is_active": user.is_active, "mfa_enabled": user.mfa_enabled, "created_at": user.created_at.isoformat() if user.created_at else None, "updated_at": user.updated_at.isoformat() if user.updated_at else None, "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None}
 
 
 def get_or_bootstrap_user(session: Session, username: str) -> User | None:
     user = session.get(User, username)
     if user:
         return user
-    if username == settings.admin_username:
+    if settings.auth_mode == "local" and username == settings.admin_username:
         user = User(username=settings.admin_username, credential_hash=settings.admin_credential_hash, role=UserRole.superadmin, full_name="Initial admin", is_active=True)
         session.add(user)
         session.commit()
@@ -129,9 +134,19 @@ portal_device_payload = device_payload
 @app.websocket("/api/software/ws")
 @app.websocket("/software/ws")
 async def software_ws(websocket: WebSocket):
+    try:
+        verify_admin_session(websocket.cookies.get(SESSION_COOKIE_NAME))
+    except HTTPException:
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     try:
         while True:
+            try:
+                verify_admin_session(websocket.cookies.get(SESSION_COOKIE_NAME))
+            except HTTPException:
+                await websocket.close(code=1008)
+                return
             with next(get_session()) as session:
                 snapshot = software_jobs_snapshot(session)
             await websocket.send_json(snapshot)
@@ -149,6 +164,8 @@ def healthz():
 @app.post("/auth/login", tags=["Auth"])
 @limiter.limit("5/minute")
 def login(request: Request, response: Response, body: LoginRequest, session: Session = Depends(get_session)):
+    if settings.auth_mode != "local":
+        raise HTTPException(status_code=403, detail="Sign in with Microsoft Entra ID")
     ip = client_ip(request)
     supplied = getattr(body, "credential", None) or getattr(body, "password", None)
     user = session.get(User, body.username)
@@ -200,6 +217,8 @@ def profile(actor: str = Depends(require_admin), session: Session = Depends(get_
 @app.post("/api/profile/change-password", tags=["Profile"])
 @app.post("/profile/change-password", tags=["Profile"])
 def change_profile_password(body: ProfileUpdateRequest, actor: str = Depends(require_admin), session: Session = Depends(get_session)):
+    if settings.auth_mode == "entra":
+        raise HTTPException(status_code=403, detail="Credentials are managed in Microsoft Entra ID")
     user = current_user(session, actor)
     if not verify_secret(body.current_value, user.credential_hash):
         raise HTTPException(status_code=401, detail="current credential is invalid")
@@ -224,6 +243,8 @@ def list_users(actor: str = Depends(require_admin), session: Session = Depends(g
 @app.post("/api/users", tags=["RBAC"])
 @app.post("/users", tags=["RBAC"])
 def create_user(body: UserCreateRequest, actor: str = Depends(require_admin), session: Session = Depends(get_session)):
+    if settings.auth_mode == "entra":
+        raise HTTPException(status_code=403, detail="Accounts and roles are managed in Microsoft Entra ID")
     require_admin_role(session, actor)
     if session.get(User, body.username):
         raise HTTPException(status_code=409, detail="user already exists")
@@ -242,6 +263,8 @@ def create_user(body: UserCreateRequest, actor: str = Depends(require_admin), se
 @app.patch("/api/users/{username}", tags=["RBAC"])
 @app.patch("/users/{username}", tags=["RBAC"])
 def update_user(username: str, body: UserUpdateRequest, actor: str = Depends(require_admin), session: Session = Depends(get_session)):
+    if settings.auth_mode == "entra":
+        raise HTTPException(status_code=403, detail="Accounts and roles are managed in Microsoft Entra ID")
     require_admin_role(session, actor)
     user = session.get(User, username)
     if not user:
