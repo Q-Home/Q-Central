@@ -83,6 +83,7 @@ async function openDeleteWizard(){
 
 function addButton(){
   if(document.querySelector('.enroll-fab')) return;
+  ensureStyles();
   const add=document.createElement('button');
   add.className='enroll-fab';
   add.textContent='+ Add Device';

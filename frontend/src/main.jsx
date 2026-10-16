@@ -4,6 +4,7 @@ import {Activity, AlertTriangle, Bell, Boxes, CheckSquare, CloudUpload, Cpu, Dat
 import './style.css';
 import InventoryModule from './components/inventory/DeviceInventory.jsx';
 import './enrollment-bootstrap.js';
+import {normalizeDevices} from './device-data.mjs';
 
 const api='/api';
 const roles=['superadmin','admin','support','installer','readonly'];
@@ -37,7 +38,20 @@ function App(){
   const [error,setError]=useState(''),[notice,setNotice]=useState('');
   useEffect(()=>{document.body.classList.toggle('dark',dark);localStorage.setItem('qcentral-theme',dark?'dark':'light')},[dark]);
   async function apiFetch(path,options={}){return fetch(api+path,{credentials:'include',...options,headers:{'Content-Type':'application/json',...(options.headers||{})}})}
-  async function load(clear=false){if(clear){setError('');setNotice('')} const r=await apiFetch('/devices'); if(!r.ok){setUser(null);setError('Sessie verlopen of geen toegang.');return} const ds=await r.json(); setDevices(ds); const mr=await apiFetch('/monitoring/overview'); if(mr.ok)setMonitoring(await mr.json());}
+  async function load(clear=false){
+    if(clear){setError('');setNotice('')}
+    try{
+      const r=await apiFetch('/devices');
+      if(r.status===401||r.status===403){setUser(null);setError('Sessie verlopen of geen toegang.');return}
+      if(!r.ok)throw new Error(`Devices ophalen mislukt (${r.status}).`);
+      setDevices(normalizeDevices(await r.json()));
+      const mr=await apiFetch('/monitoring/overview');
+      if(mr.status===401||mr.status===403){setUser(null);setError('Sessie verlopen of geen toegang.');return}
+      if(!mr.ok)throw new Error(`Monitoring ophalen mislukt (${mr.status}).`);
+      const data=await mr.json();
+      setMonitoring({...data,devices:normalizeDevices(data.devices)});
+    }catch(e){setError(`Gegevens laden mislukt: ${e.message}`)}
+  }
   async function checkSession(){try{const r=await apiFetch('/auth/me'); if(r.ok){setUser(await r.json()); await load()}}catch(e){}}
   useEffect(()=>{apiFetch('/auth/config').then(r=>{if(!r.ok)throw new Error();return r.json()}).then(setAuth).catch(()=>setError('Authenticatieconfiguratie laden mislukt.')); const url=new URL(window.location.href); if(url.searchParams.has('auth_error')){setError('Microsoft-login mislukt of geen Q-Central-toegang.');url.searchParams.delete('auth_error');window.history.replaceState({},'',url.pathname+url.search+url.hash)} checkSession()},[]); useEffect(()=>{if(!user)return; const t=setInterval(()=>load(),30000); return()=>clearInterval(t)},[user]);
   async function loginAdmin(e){e.preventDefault();setError('');const r=await apiFetch('/auth/login',{method:'POST',body:JSON.stringify(login)}); if(!r.ok){setError('Login mislukt.');return} setUser(await r.json()); await load()}
