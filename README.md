@@ -20,6 +20,15 @@ Production-ready selfhosted control plane for Q-Box devices over a ZeroTier over
 
 ## Quick production deploy
 
+Configure Microsoft Entra ID using the [Entra implementation and operations guide](docs/ENTRA.md)
+before testing login. The Cohvera-style setup assigns the existing `SG-PORTAL-Admins`
+group to the `Portal.Admin` app role **on the Q-Central enterprise application**.
+It uses Q-Central's own client ID and secret in the same organisation tenant;
+no group IDs are required in `.env` for this setup.
+
+The production Compose stack reads `deploy/.env`. Preserve existing configuration
+when updating it; a change to `.env` requires recreating the affected containers.
+
 ```bash
 cd deploy
 cp .env.production.example .env
