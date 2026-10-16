@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     entra_client_id: UUID | None = None
     entra_client_secret: str | None = None
     entra_session_minutes: int = Field(default=15, ge=1, le=60)
+    entra_admin_group_ids: str = ""
+    entra_superadmin_group_ids: str = ""
     admin_role: str = "admin"
     mfa_required: bool = False
     mfa_seed: str | None = None
@@ -36,6 +38,12 @@ class Settings(BaseSettings):
     ota_verify_signatures: bool = True
     ota_public_key_pem: str | None = None
     geoip_allowed_countries: str = ""
+
+    @field_validator("entra_admin_group_ids", "entra_superadmin_group_ids")
+    @classmethod
+    def validate_group_ids(cls, value: str) -> str:
+        # Exact object IDs only; group names and wildcards cannot grant access.
+        return ",".join(str(UUID(item.strip())) for item in value.split(",") if item.strip())
 
     @field_validator("entra_tenant_id", "entra_client_id", "entra_client_secret", mode="before")
     @classmethod

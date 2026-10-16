@@ -62,10 +62,32 @@ def identity_from_claims(claims: dict) -> tuple[str, UserRole]:
     roles = claims.get("roles", [])
     if not isinstance(roles, list):
         raise LoginPolicyError("invalid_roles_claim")
+    admin_groups = set(filter(None, settings.entra_admin_group_ids.split(",")))
+    superadmin_groups = set(filter(None, settings.entra_superadmin_group_ids.split(",")))
+    group_ids = set()
+    group_error = "missing_groups_claim"
+    if admin_groups or superadmin_groups:
+        if "groups" in claims:
+            groups = claims["groups"]
+            if not isinstance(groups, list) or not all(isinstance(group, str) for group in groups):
+                raise LoginPolicyError("invalid_groups_claim")
+            try:
+                group_ids = {str(UUID(group)) for group in groups}
+            except ValueError:
+                raise LoginPolicyError("invalid_groups_claim") from None
+            group_error = "unmatched_entra_group"
+        elif claims.get("hasgroups") or "groups" in (claims.get("_claim_names") or {}):
+            group_error = "groups_overage"
     if "QCentral.SuperAdmin" in roles:
         role = UserRole.superadmin
-    elif "QCentral.Admin" in roles:
+    elif group_ids & superadmin_groups:
+        role = UserRole.superadmin
+    elif "QCentral.Admin" in roles or "Portal.Admin" in roles:
         role = UserRole.admin
+    elif group_ids & admin_groups:
+        role = UserRole.admin
+    elif admin_groups or superadmin_groups:
+        raise LoginPolicyError(group_error)
     else:
         raise LoginPolicyError("missing_qcentral_role")
     return f"entra:{settings.entra_tenant_id}:{oid}", role

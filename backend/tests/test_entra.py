@@ -109,7 +109,7 @@ class EntraTests(unittest.TestCase):
         for changes in [{"iss": "https://evil.test"}, {"aud": "wrong-client"},
                         {"tid": "44444444-4444-4444-4444-444444444444"},
                         {"oid": None}, {"oid": "invalid"}, {"roles": []},
-                        {"roles": ["Portal.Admin"]}, {"roles": "QCentral.Admin"},
+                        {"roles": ["Portal.User"]}, {"roles": "QCentral.Admin"},
                         {"nonce": "wrong"}, {"exp": int(time.time()) - 300},
                         {"nbf": int(time.time()) + 600}, {"exp": None}, {"nbf": None}]:
             with self.subTest(changes=changes):
@@ -129,9 +129,82 @@ class EntraTests(unittest.TestCase):
 
     def test_missing_role_is_reported_in_server_log(self):
         with self.assertLogs("qcentral.entra", level="WARNING") as logged:
-            response, _, _ = self.callback({"roles": ["Portal.Admin"]})
+            response, _, _ = self.callback({"roles": ["Portal.User"]})
         self.assertIn("auth_error", response.headers["location"])
         self.assertIn("reason=missing_qcentral_role", " ".join(logged.output))
+
+    def test_cohvera_portal_admin_role_grants_admin_without_group_ids(self):
+        response, _, _ = self.callback({"roles": ["Portal.Admin"]})
+        self.assertNotIn("auth_error", response.headers["location"])
+        self.assertEqual(self.client.get("/api/auth/me").json()["role"], "admin")
+
+    def test_cohvera_role_requires_exact_value_not_group_name(self):
+        for roles in [["portal.admin"], ["SG-PORTAL-Admins"], ["Portal.User"]]:
+            with self.subTest(roles=roles):
+                response, _, _ = self.callback({"roles": roles})
+                self.assertIn("auth_error", response.headers["location"])
+                self.assertEqual(self.client.get("/api/auth/me").status_code, 401)
+
+    def test_cohvera_role_still_requires_qcentral_audience_and_tenant(self):
+        for invalid in [{"aud": "cohvera-client-id"}, {"tid": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"}]:
+            with self.subTest(invalid=invalid):
+                response, _, _ = self.callback({"roles": ["Portal.Admin"], **invalid})
+                self.assertIn("auth_error", response.headers["location"])
+
+    def test_configured_group_grants_access_without_app_roles(self):
+        group = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        for setting, role in [("entra_admin_group_ids", "admin"), ("entra_superadmin_group_ids", "superadmin")]:
+            with self.subTest(role=role), patch.object(settings, setting, group):
+                response, _, _ = self.callback({"roles": [], "groups": [group.upper()]})
+                self.assertNotIn("auth_error", response.headers["location"])
+                self.assertEqual(self.client.get("/api/auth/me").json()["role"], role)
+
+    def test_group_mapping_rejects_missing_unknown_and_malformed_claims(self):
+        group = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        cases = [({}, "missing_groups_claim"),
+                 ({"groups": []}, "unmatched_entra_group"),
+                 ({"groups": ["bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"]}, "unmatched_entra_group"),
+                 ({"groups": group}, "invalid_groups_claim"),
+                 ({"groups": ["Cohvera Admins"]}, "invalid_groups_claim"),
+                 ({"hasgroups": True}, "groups_overage"),
+                 ({"_claim_names": {"groups": "src1"}}, "groups_overage")]
+        with patch.object(settings, "entra_admin_group_ids", group):
+            for claims, reason in cases:
+                with self.subTest(claims=claims), self.assertLogs("qcentral.entra", level="WARNING") as logged:
+                    response, _, _ = self.callback({"roles": [], **claims})
+                self.assertIn("auth_error", response.headers["location"])
+                self.assertIn("reason=" + reason, " ".join(logged.output))
+                self.assertEqual(self.client.get("/api/auth/me").status_code, 401)
+
+    def test_unconfigured_group_does_not_grant_access(self):
+        response, _, _ = self.callback({"roles": [], "groups": ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"]})
+        self.assertIn("auth_error", response.headers["location"])
+
+    def test_highest_role_wins_and_group_changes_refresh_role(self):
+        admin = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        superadmin = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        with patch.object(settings, "entra_admin_group_ids", admin), patch.object(settings, "entra_superadmin_group_ids", superadmin):
+            self.callback({"roles": ["QCentral.Admin"], "groups": [admin, superadmin]})
+            self.assertEqual(self.client.get("/api/auth/me").json()["role"], "superadmin")
+            self.callback({"roles": [], "groups": [admin]})
+            self.assertEqual(self.client.get("/api/auth/me").json()["role"], "admin")
+            self.callback({"roles": [], "groups": []})
+            self.assertEqual(self.client.get("/api/auth/me").status_code, 401)
+
+    def test_configured_groups_do_not_bypass_token_validation(self):
+        group = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        with patch.object(settings, "entra_admin_group_ids", group):
+            for invalid in [{"tid": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"}, {"nonce": "wrong"}]:
+                response, _, _ = self.callback({"roles": [], "groups": [group], **invalid})
+                self.assertIn("auth_error", response.headers["location"])
+
+    def test_group_configuration_accepts_only_object_ids(self):
+        group = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        configured = Settings(_env_file=None, entra_admin_group_ids="  " + group.upper() + ", " + group)
+        self.assertEqual(configured.entra_admin_group_ids, group + "," + group)
+        for invalid in ["*", "Cohvera Admins"]:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                Settings(_env_file=None, entra_admin_group_ids=invalid)
 
     def test_invalid_secret_diagnostic_does_not_log_upstream_description(self):
         from authlib.integrations.base_client.errors import OAuthError
